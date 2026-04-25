@@ -1005,19 +1005,18 @@ def stream_logs(instance_id: str):
                     )
                 else:
                     if len(current_logs) < sent_count:
-                        # Ring buffer may have rotated; resync from current buffer.
                         delta_lines = current_logs
                     else:
                         delta_lines = current_logs[sent_count:]
                     sent_count = len(current_logs)
 
-                    if delta_lines:
+                    for line in delta_lines:
                         yield _sse_event(
                             "append",
                             {
                                 "instance_id": instance_id,
                                 "status": status,
-                                "lines": delta_lines,
+                                "line": line,
                             },
                         )
             else:

@@ -19,8 +19,6 @@ const els = {
   modelSelect: document.getElementById("model_select"),
   host: document.getElementById("host"),
   port: document.getElementById("port"),
-  nCtx: document.getElementById("n_ctx"),
-  ctxSizeOptions: document.getElementById("ctx_size_options"),
   nThreads: document.getElementById("n_threads"),
   gpuLayers: document.getElementById("gpu_layers"),
   nCtxSelect: document.getElementById("n_ctx_select"),
@@ -89,6 +87,7 @@ function stopLogStream() {
 
 function openLogModal() {
   els.logModal.classList.remove("hidden");
+  els.logOutputLarge.scrollTop = els.logOutputLarge.scrollHeight;
 }
 
 function closeLogModal() {
@@ -128,7 +127,8 @@ function collectPayload() {
     visual_args: {
       model_path: els.modelPath.value.trim(),
       host: els.host.value.trim(),
-      n_ctx: Number(els.nCtx.value) || null,
+      port: Number(els.port.value) || null,
+      n_ctx: Number(els.nCtxSelect.value) || null,
       n_threads: Number(els.nThreads.value) || null,
       gpu_layers: els.gpuLayers.value === "" ? null : Number(els.gpuLayers.value),
       extra_flags: readExtraFlags(),
@@ -138,11 +138,6 @@ function collectPayload() {
 }
 
 function clearForm() {
-  const current = String((els.nCtx?.value || "").trim()); if (!els.nCtxSelect) return;
-  if (current) {
-    const exists = [...els.nCtxSelect.options].some((opt) => opt.value === current);
-    els.nCtxSelect.value = exists ? current : "";
-  }
   els.name.value = "";
   els.serverDir.value = "";
   els.versionSelect.value = "";
@@ -150,7 +145,7 @@ function clearForm() {
   els.modelSelect.value = "";
   els.host.value = "0.0.0.0";
   els.port.value = "8080";
-  els.nCtx.value = "4096";
+  els.nCtxSelect.value = "32768";
   els.nThreads.value = "8";
   els.gpuLayers.value = "0";
   els.freeform.value = "";
@@ -197,7 +192,7 @@ function startEdit(item) {
   els.modelSelect.value = "";
   els.host.value = visual.host || "0.0.0.0";
   els.port.value = visual.port ?? "";
-  els.nCtx.value = visual.n_ctx ?? "";
+  els.nCtxSelect.value = String(visual.n_ctx ?? "32768");
   els.nThreads.value = visual.n_threads ?? "";
   els.gpuLayers.value = visual.gpu_layers ?? "";
   els.freeform.value = item.freeform_args || "";
@@ -300,7 +295,7 @@ async function discoverVersions() {
     const items = Array.isArray(data.items) ? data.items : [];
     const currentSelection = els.versionSelect.value;
 
-    els.versionSelect.innerHTML = "<option value=''>自动扫描中，或使用手工输入</option>";
+    els.versionSelect.innerHTML = "<option value=''>扫描中...</option>";
     items.forEach((item) => {
       const path = typeof item === "string" ? item : item.path;
       const name = typeof item === "string" ? item : item.name;
@@ -329,7 +324,7 @@ async function discoverModels() {
     const items = Array.isArray(data.items) ? data.items : [];
     const currentSelection = els.modelSelect.value;
 
-    els.modelSelect.innerHTML = "<option value=''>自动扫描中，或使用手工输入</option>";
+    els.modelSelect.innerHTML = "<option value=''>扫描中...</option>";
     items.forEach((item) => {
       const path = typeof item === "string" ? item : item.path;
       const name = typeof item === "string" ? item : item.name;
@@ -361,6 +356,8 @@ function renderInstances(items) {
     return;
   }
 
+  const firstRunning = items.find((item) => isRunningStatus(item.status));
+
   els.instances.innerHTML = "";
   items.forEach((item) => {
     const toggleText = isRunningStatus(item.status) ? "禁用" : "启用";
@@ -391,6 +388,10 @@ function renderInstances(items) {
 
     els.instances.appendChild(card);
   });
+
+  if (firstRunning && !selectedInstanceId) {
+    selectInstance(firstRunning.instance_id, firstRunning.name);
+  }
 }
 
 async function refreshInstances() {
@@ -428,9 +429,11 @@ function startLogStream(instanceId) {
     }
     try {
       const payload = JSON.parse(event.data || "{}");
-      appendLogLines(payload.lines || []);
+      const line = payload.line;
+      if (line) {
+        appendLogLines([line]);
+      }
     } catch (_e) {
-      // 增量日志解析失败时，保持当前显示内容。
     }
   });
 
@@ -482,19 +485,6 @@ els.versionSelect.addEventListener("change", () => {
     els.serverDir.value = els.versionSelect.value;
     previewCommand();
   }
-});
-
-els.nCtxSelect.addEventListener("change", () => {
-  if (els.nCtxSelect.value) {
-    els.nCtx.value = els.nCtxSelect.value;
-    previewCommand();
-  }
-});
-
-els.nCtx.addEventListener("input", () => {
-  const text = String(els.nCtx.value || "").trim();
-  const exists = [...els.nCtxSelect.options].some((opt) => opt.value === text);
-  els.nCtxSelect.value = exists ? text : "";
 });
 
 els.modelSelect.addEventListener("change", () => {
