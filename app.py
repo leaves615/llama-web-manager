@@ -10,10 +10,18 @@ import time
 import uuid
 from collections import deque
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
+import psutil
 from flask import Flask, Response, jsonify, render_template, request, stream_with_context
 import yaml
+
+
+APP_ROOT = Path(__file__).parent
+LOG_DIR = APP_ROOT / "logs"
+DB_FILE = APP_ROOT / "instances.db"
+CONFIG_FILE = APP_ROOT / "config.yaml"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 
 APP_ROOT = Path(__file__).parent
@@ -95,6 +103,7 @@ class InstanceRecord:
         visual_args: Dict,
         freeform_args: str,
         created_at: str | None = None,
+        is_attached: bool = False,
     ) -> None:
         self.instance_id = instance_id
         self.name = name
@@ -108,6 +117,7 @@ class InstanceRecord:
         self.stopped_by_manager = False
         self.logs = deque(maxlen=3000)
         self._lock = threading.Lock()
+        self._log_reader_thread: threading.Thread | None = None
 
     def append_log(self, line: str) -> None:
         with self._lock:
@@ -121,11 +131,29 @@ class InstanceRecord:
 
     @property
     def pid(self) -> int:
-        return self.process.pid
+        if self.process:
+            return self.process.pid
+        ps_proc = getattr(self, "_ps_process", None)
+        if ps_proc:
+            return ps_proc.pid
+        return 0
 
     @property
     def status(self) -> str:
-        return "running" if self.process.poll() is None else f"exited({self.process.returncode})"
+        if self.process:
+            return "running" if self.process.poll() is None else f"exited({self.process.returncode})"
+        ps_proc = getattr(self, "_ps_process", None)
+        if ps_proc:
+            try:
+                if ps_proc.is_running():
+                    return "running"
+                return "stopped"
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                return "stopped"
+        return "stopped"
+
+    def set_log_reader_thread(self, thread: threading.Thread | None) -> None:
+        self._log_reader_thread = thread
 
 
 class InstanceManager:
@@ -139,6 +167,14 @@ class InstanceManager:
         conn = sqlite3.connect(DB_FILE)
         conn.row_factory = sqlite3.Row
         return conn
+
+    def _db_execute(self, sql: str, params=()):
+        with self._db_lock:
+            conn = self._db_conn()
+            cursor = conn.cursor()
+            cursor.execute(sql, params)
+            conn.commit()
+            conn.close()
 
     def _init_db(self) -> None:
         with self._db_lock:
@@ -155,11 +191,17 @@ class InstanceManager:
                         log_file TEXT NOT NULL,
                         pid INTEGER,
                         status TEXT NOT NULL,
+                        command TEXT,
                         created_at TEXT NOT NULL,
-                        updated_at TEXT NOT NULL
+                        updated_at TEXT NOT NULL,
+                        command TEXT
                     )
                     """
                 )
+                try:
+                    conn.execute("ALTER TABLE instances ADD COLUMN command TEXT")
+                except sqlite3.OperationalError:
+                    pass
 
     def _upsert_instance(
         self,
@@ -267,6 +309,44 @@ class InstanceManager:
             "freeform_args": row["freeform_args"],
         }
 
+    def read_log_file(self, instance_id: str, lines: int = 200) -> List[str]:
+        persisted = self._get_persisted_instance(instance_id)
+        if not persisted:
+            return []
+        
+        log_file = Path(persisted["log_file"])
+        if not log_file.exists():
+            return []
+        
+        try:
+            with open(log_file, "r", encoding="utf-8", errors="replace") as f:
+                all_lines = f.readlines()
+                return [line.rstrip("\n\r") for line in all_lines[-lines:] if line.strip()]
+        except Exception:
+            return []
+        with self._db_lock:
+            with self._db_conn() as conn:
+                row = conn.execute(
+                    "SELECT * FROM instances WHERE instance_id = ?",
+                    (instance_id,),
+                ).fetchone()
+
+        if not row:
+            return None
+
+        return {
+            "instance_id": row["instance_id"],
+            "name": row["name"],
+            "executable_path": row["executable_path"],
+            "pid": row["pid"],
+            "status": row["status"],
+            "created_at": row["created_at"],
+            "command": json.loads(row["command_json"]),
+            "log_file": row["log_file"],
+            "visual_args": json.loads(row["visual_args_json"]),
+            "freeform_args": row["freeform_args"],
+        }
+
     def _start_process(self, command: List[str]) -> subprocess.Popen:
         creationflags = 0
         if os.name == "nt":
@@ -285,12 +365,25 @@ class InstanceManager:
 
     def _terminate_process(self, record: InstanceRecord) -> None:
         record.stopped_by_manager = True
-        if record.process.poll() is None:
-            record.process.terminate()
-            try:
-                record.process.wait(timeout=8)
-            except subprocess.TimeoutExpired:
-                record.process.kill()
+        if record.process:
+            if record.process.poll() is None:
+                record.process.terminate()
+                try:
+                    record.process.wait(timeout=8)
+                except subprocess.TimeoutExpired:
+                    record.process.kill()
+        else:
+            ps_proc = getattr(record, "_ps_process", None)
+            if ps_proc:
+                try:
+                    proc = psutil.Process(ps_proc.pid)
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=8)
+                    except psutil.TimeoutExpired:
+                        proc.kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
 
     def _read_log_file_tail(self, file_path: str, lines: int) -> List[str]:
         path = Path(file_path)
@@ -397,22 +490,7 @@ class InstanceManager:
         return sorted(set(found), key=lambda p: p.lower())
 
     def list_instances(self) -> List[Dict]:
-        with self._lock:
-            running = {record.instance_id: self._serialize(record) for record in self.instances.values()}
-
-        persisted = self._list_persisted_instances()
-        merged: List[Dict] = []
-        seen = set()
-        for item in persisted:
-            rid = item["instance_id"]
-            merged.append(running.get(rid, item))
-            seen.add(rid)
-
-        for rid, item in running.items():
-            if rid not in seen:
-                merged.append(item)
-
-        return merged
+        return self._list_persisted_instances()
 
     def get_instance(self, instance_id: str) -> InstanceRecord | None:
         with self._lock:
@@ -431,94 +509,62 @@ class InstanceManager:
         instance_id = str(uuid.uuid4())[:8]
         command = self._build_command(server_dir, visual_args, freeform_args)
         log_file = LOG_DIR / f"{instance_id}.log"
-        process = self._start_process(command)
+        created_at = utc_now_iso()
 
-        record = InstanceRecord(
+        self._upsert_instance(
             instance_id=instance_id,
             name=name or f"llama-{instance_id}",
             executable_path=server_dir,
             command=command,
-            process=process,
-            log_file=log_file,
             visual_args=visual_args,
             freeform_args=freeform_args,
+            log_file=log_file,
+            pid=None,
+            status="stopped",
+            created_at=created_at,
         )
 
-        with self._lock:
-            self.instances[instance_id] = record
-
-        self._upsert_instance(
-            instance_id=record.instance_id,
-            name=record.name,
-            executable_path=server_dir,
-            command=record.command,
-            visual_args=record.visual_args,
-            freeform_args=record.freeform_args,
-            log_file=record.log_file,
-            pid=record.pid,
-            status=record.status,
-            created_at=record.created_at,
-        )
-
-        threading.Thread(
-            target=self._capture_output,
-            args=(record,),
-            daemon=True,
-        ).start()
-
-        return self._serialize(record)
+        return {
+            "instance_id": instance_id,
+            "name": name or f"llama-{instance_id}",
+            "executable_path": server_dir,
+            "command": command,
+            "pid": None,
+            "status": "stopped",
+            "created_at": created_at,
+            "log_file": str(log_file),
+            "visual_args": visual_args,
+            "freeform_args": freeform_args,
+        }
 
     def start_instance(self, instance_id: str) -> Dict:
         persisted = self._get_persisted_instance(instance_id)
         if not persisted:
             raise ValueError("实例不存在")
 
-        running = self.get_instance(instance_id)
-        if running and running.process.poll() is None:
-            return self._serialize(running)
-
         command = self._build_command(
             server_dir=persisted["executable_path"],
             visual_args=persisted["visual_args"],
             freeform_args=persisted["freeform_args"],
         )
-        process = self._start_process(command)
 
-        record = InstanceRecord(
-            instance_id=instance_id,
-            name=persisted["name"],
-            executable_path=persisted["executable_path"],
-            command=command,
-            process=process,
-            log_file=Path(persisted["log_file"]),
-            visual_args=persisted["visual_args"],
-            freeform_args=persisted["freeform_args"],
-            created_at=persisted["created_at"],
+        self._db_execute(
+            "UPDATE instances SET command_json = ?, command = 'start', updated_at = ? WHERE instance_id = ?",
+            (json.dumps(command, ensure_ascii=False), utc_now_iso(), instance_id),
         )
 
-        with self._lock:
-            self.instances[instance_id] = record
-
-        self._upsert_instance(
-            instance_id=record.instance_id,
-            name=record.name,
-            executable_path=record.executable_path,
-            command=record.command,
-            visual_args=record.visual_args,
-            freeform_args=record.freeform_args,
-            log_file=record.log_file,
-            pid=record.pid,
-            status=record.status,
-            created_at=record.created_at,
-        )
-
-        threading.Thread(
-            target=self._capture_output,
-            args=(record,),
-            daemon=True,
-        ).start()
-
-        return self._serialize(record)
+        return {
+            "instance_id": instance_id,
+            "name": persisted["name"],
+            "executable_path": persisted["executable_path"],
+            "command": command,
+            "pid": persisted.get("pid"),
+            "status": "starting",
+            "created_at": persisted["created_at"],
+            "log_file": persisted["log_file"],
+            "visual_args": persisted["visual_args"],
+            "freeform_args": persisted["freeform_args"],
+        }
 
     def update_instance(
         self,
@@ -536,72 +582,42 @@ class InstanceManager:
             raise ValueError("实例不存在")
 
         command = self._build_command(server_dir, visual_args, freeform_args)
-        log_file = Path(persisted["log_file"])
+        log_file = persisted["log_file"]
 
-        with self._lock:
-            old_record = self.instances.get(instance_id)
-
-        if old_record:
-            self._terminate_process(old_record)
-
-        process = self._start_process(command)
-
-        record = InstanceRecord(
-            instance_id=instance_id,
-            name=name or f"llama-{instance_id}",
-            executable_path=server_dir,
-            command=command,
-            process=process,
-            log_file=log_file,
-            visual_args=visual_args,
-            freeform_args=freeform_args,
-            created_at=persisted["created_at"],
+        self._db_execute(
+            "UPDATE instances SET name = ?, executable_path = ?, command_json = ?, visual_args_json = ?, freeform_args = ?, command = 'start', updated_at = ? WHERE instance_id = ?",
+            (name, server_dir, json.dumps(command, ensure_ascii=False), json.dumps(visual_args, ensure_ascii=False), freeform_args, utc_now_iso(), instance_id),
         )
 
-        with self._lock:
-            self.instances[instance_id] = record
-
-        self._upsert_instance(
-            instance_id=record.instance_id,
-            name=record.name,
-            executable_path=record.executable_path,
-            command=record.command,
-            visual_args=record.visual_args,
-            freeform_args=record.freeform_args,
-            log_file=record.log_file,
-            pid=record.pid,
-            status=record.status,
-            created_at=record.created_at,
-        )
-
-        threading.Thread(
-            target=self._capture_output,
-            args=(record,),
-            daemon=True,
-        ).start()
-
-        return self._serialize(record)
+        return {
+            "instance_id": instance_id,
+            "name": name,
+            "executable_path": server_dir,
+            "command": command,
+            "pid": persisted.get("pid"),
+            "status": "restarting",
+            "created_at": persisted["created_at"],
+            "log_file": log_file,
+            "visual_args": visual_args,
+            "freeform_args": freeform_args,
+        }
 
     def stop_instance(self, instance_id: str) -> Dict:
-        record = self.get_instance(instance_id)
-        if record:
-            self._terminate_process(record)
-            with self._lock:
-                self.instances.pop(instance_id, None)
-            self._update_instance_status(instance_id, None, "disabled")
-            payload = self._serialize(record)
-            payload["status"] = "disabled"
-            payload["pid"] = None
-            return payload
-
         persisted = self._get_persisted_instance(instance_id)
         if not persisted:
             raise ValueError("实例不存在")
 
-        self._update_instance_status(instance_id, None, "disabled")
-        persisted["status"] = "disabled"
-        persisted["pid"] = None
-        return persisted
+        self._db_execute(
+            "UPDATE instances SET command = 'stop', updated_at = ? WHERE instance_id = ?",
+            (utc_now_iso(), instance_id),
+        )
+
+        return {
+            "instance_id": instance_id,
+            "name": persisted["name"],
+            "status": "stopping",
+            "pid": persisted.get("pid"),
+        }
 
     def _capture_output(self, record: InstanceRecord) -> None:
         with record.log_file.open("a", encoding="utf-8") as f:
@@ -878,6 +894,39 @@ auto_scan_service = AutoScanService(manager)
 auto_scan_service.start()
 
 
+DAEMON_PROCESS_NAME = "daemon.py"
+
+
+def _ensure_daemon_running():
+    current_pid = os.getpid()
+    for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+        try:
+            if proc.info["pid"] == current_pid:
+                continue
+            cmdline = proc.info.get("cmdline") or []
+            if any("daemon.py" in str(arg) for arg in cmdline):
+                return
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+
+    print("[App] Daemon not running, starting...")
+    daemon_path = APP_ROOT / "daemon.py"
+    creationflags = 0
+    if os.name == "nt":
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+    subprocess.Popen(
+        ["python", str(daemon_path)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=creationflags,
+        start_new_session=True,
+    )
+    time.sleep(2)
+
+
+_ensure_daemon_running()
+
+
 def _sse_event(event: str, payload: Dict) -> str:
     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
@@ -885,6 +934,123 @@ def _sse_event(event: str, payload: Dict) -> str:
 @app.route("/")
 def index():
     return render_template("index.html")
+
+
+@app.get("/api/daemon/status")
+def daemon_status():
+    import psutil
+
+    current_pid = os.getpid()
+    for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+        try:
+            if proc.info["pid"] == current_pid:
+                continue
+            cmdline = proc.info.get("cmdline") or []
+            if any("daemon.py" in str(arg) for arg in cmdline):
+                return jsonify({"running": True, "pid": proc.info["pid"]})
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    return jsonify({"running": False, "pid": None})
+
+
+@app.get("/api/daemon/status/stream")
+def daemon_status_stream():
+    def generate():
+        last_status = None
+        last_instance_status = None
+        while True:
+            try:
+                import psutil
+
+                current_pid = os.getpid()
+                running = False
+                pid = None
+                for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+                    try:
+                        if proc.info["pid"] == current_pid:
+                            continue
+                        cmdline = proc.info.get("cmdline") or []
+                        if any("daemon.py" in str(arg) for arg in cmdline):
+                            running = True
+                            pid = proc.info["pid"]
+                            break
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        continue
+
+                status = {"running": running, "pid": pid}
+                if status != last_status:
+                    last_status = status
+                    yield _sse_event("status", status)
+
+                if running:
+                    items = manager.list_instances()
+                    instance_status = {item["instance_id"]: item.get("status") for item in items}
+                    if instance_status != last_instance_status:
+                        last_instance_status = instance_status
+                        yield _sse_event("instances", {"items": items})
+
+            except Exception:
+                pass
+            time.sleep(2)
+
+    headers = {
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    }
+    return Response(stream_with_context(generate()), mimetype="text/event-stream", headers=headers)
+
+
+@app.post("/api/daemon/start")
+def daemon_start():
+    import psutil
+
+    current_pid = os.getpid()
+    for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+        try:
+            if proc.info["pid"] == current_pid:
+                continue
+            cmdline = proc.info.get("cmdline") or []
+            if any("daemon.py" in str(arg) for arg in cmdline):
+                return jsonify({"error": "守护进程已在运行"}), 400
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+
+    daemon_path = APP_ROOT / "daemon.py"
+    creationflags = 0
+    if os.name == "nt":
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+    subprocess.Popen(
+        ["python", str(daemon_path)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=creationflags,
+        start_new_session=True,
+    )
+    time.sleep(2)
+    return jsonify({"success": True})
+
+
+@app.post("/api/daemon/stop")
+def daemon_stop():
+    import psutil
+
+    current_pid = os.getpid()
+    for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+        try:
+            if proc.info["pid"] == current_pid:
+                continue
+            cmdline = proc.info.get("cmdline") or []
+            if any("daemon.py" in str(arg) for arg in cmdline):
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except psutil.TimeoutExpired:
+                    proc.kill()
+                return jsonify({"success": True})
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    return jsonify({"error": "守护进程未运行"}), 400
 
 
 @app.get("/api/instances")
@@ -980,79 +1146,70 @@ def stream_logs(instance_id: str):
     lines = min(lines, 2000)
 
     def generate():
-        sent_count = 0
         snapshot_sent = False
+        last_pos = 0
         last_ping_at = time.monotonic()
+        persisted = manager._get_persisted_instance(instance_id)
+
+        if not persisted:
+            yield _sse_event("log-error", {"error": "实例不存在"})
+            yield _sse_event("end", {"reason": "not-found"})
+            return
+
+        log_file = Path(persisted["log_file"])
+        if not log_file.exists():
+            yield _sse_event("snapshot", {"instance_id": instance_id, "status": persisted["status"], "lines": []})
+            yield _sse_event("end", {"reason": "no-log-file"})
+            return
 
         while True:
-            record = manager.get_instance(instance_id)
+            try:
+                with open(log_file, "r", encoding="utf-8", errors="replace") as f:
+                    f.seek(0, 2)
+                    file_size = f.tell()
 
-            if record:
-                current_logs = record.get_logs(3000)
-                status = record.status
-
-                if not snapshot_sent:
-                    initial_lines = current_logs[-lines:]
-                    sent_count = len(current_logs)
-                    snapshot_sent = True
-                    yield _sse_event(
-                        "snapshot",
-                        {
-                            "instance_id": instance_id,
-                            "status": status,
-                            "lines": initial_lines,
-                        },
-                    )
-                else:
-                    if len(current_logs) < sent_count:
-                        delta_lines = current_logs
-                    else:
-                        delta_lines = current_logs[sent_count:]
-                    sent_count = len(current_logs)
-
-                    for line in delta_lines:
+                    if not snapshot_sent:
+                        f.seek(0)
+                        all_lines = f.readlines()
+                        tail_lines = all_lines[-lines:] if len(all_lines) > lines else all_lines
+                        last_pos = file_size
+                        snapshot_sent = True
                         yield _sse_event(
-                            "append",
+                            "snapshot",
                             {
                                 "instance_id": instance_id,
-                                "status": status,
-                                "line": line,
+                                "status": persisted["status"],
+                                "lines": [line.rstrip("\n\r") for line in tail_lines],
                             },
                         )
-            else:
-                matched = manager._get_persisted_instance(instance_id)
-                if not matched:
-                    yield _sse_event("log-error", {"error": "实例不存在"})
-                    yield _sse_event("end", {"reason": "not-found"})
-                    break
+                    else:
+                        if file_size > last_pos:
+                            f.seek(last_pos)
+                            new_lines = f.readlines()
+                            last_pos = file_size
+                            for line in new_lines:
+                                line = line.rstrip("\n\r")
+                                if line:
+                                    yield _sse_event(
+                                        "append",
+                                        {
+                                            "instance_id": instance_id,
+                                            "status": persisted["status"],
+                                            "line": line,
+                                        },
+                                    )
 
-                if not snapshot_sent:
-                    tail_lines = manager._read_log_file_tail(matched["log_file"], lines)
-                    yield _sse_event(
-                        "snapshot",
-                        {
-                            "instance_id": instance_id,
-                            "status": matched["status"],
-                            "lines": tail_lines,
-                        },
-                    )
+                    now = time.monotonic()
+                    if now - last_ping_at >= 15:
+                        last_ping_at = now
+                        yield ": ping\n\n"
 
-                yield _sse_event(
-                    "status",
-                    {
-                        "instance_id": instance_id,
-                        "status": matched["status"],
-                    },
-                )
-                yield _sse_event("end", {"reason": "not-running"})
+                    time.sleep(0.5)
+
+            except GeneratorExit:
                 break
-
-            now = time.monotonic()
-            if now - last_ping_at >= 15:
-                last_ping_at = now
-                yield ": ping\n\n"
-
-            time.sleep(0.7)
+            except Exception:
+                time.sleep(0.5)
 
     headers = {
         "Cache-Control": "no-cache",

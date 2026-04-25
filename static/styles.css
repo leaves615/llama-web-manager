@@ -20,6 +20,7 @@ body {
   background:
     radial-gradient(circle at 10% 10%, #f8fcff, #edf3fa 45%, #e6eef7 70%),
     linear-gradient(140deg, #f9fbff, #eaf1f8);
+  overflow: hidden;
 }
 
 .layout-two {
@@ -65,7 +66,47 @@ h1, h2 {
 
 .header-actions {
   display: flex;
+  align-items: center;
   gap: 8px;
+}
+
+.daemon-status {
+  font-size: 12px;
+  padding: 4px 8px;
+  border-radius: 4px;
+  background: #e0e0e0;
+  color: #666;
+}
+
+.daemon-status.running {
+  background: #d4edda;
+  color: #155724;
+}
+
+.daemon-status.stopped {
+  background: #f8d7da;
+  color: #721c24;
+}
+
+.daemon-panel {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 12px;
+  background: #f8f9fa;
+  border-radius: 8px;
+  margin-bottom: 12px;
+}
+
+.daemon-info {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.daemon-label {
+  font-size: 13px;
+  font-weight: 500;
 }
 
 .log-head-actions {
@@ -85,6 +126,7 @@ h1, h2 {
   display: flex;
   flex-direction: column;
   gap: 10px;
+  min-height: 0;
 }
 
 .instance-card {
@@ -138,6 +180,7 @@ h1, h2 {
 
 .log-output {
   flex: 1;
+  min-height: 0;
   background: #1a1d24;
   color: #c9d1d9;
   border-radius: 10px;
@@ -181,13 +224,13 @@ h1, h2 {
 }
 
 .log-modal-card {
-  width: 100%;
-  height: 100%;
-  max-width: 1400px;
-  max-height: 900px;
+  width: 100vw;
+  height: 100vh;
+  max-width: none;
+  max-height: none;
   background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: 14px;
+  border: none;
+  border-radius: 0;
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -432,14 +475,65 @@ button.small {
 }
 
 .site-footer {
-  position: fixed;
-  bottom: 0;
-  left: 0;
-  right: 0;
+  padding: 8px 12px;
   text-align: center;
-  padding: 8px;
-  font-size: 12px;
+  font-size: 11px;
   color: var(--muted);
-  background: linear-gradient(to top, rgba(255,255,255,0.9), transparent);
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.loading {
+  position: fixed;
+  inset: 0;
+  background: rgba(255, 255, 255, 0.8);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 9999;
+}
+
+.loading.hidden {
+  display: none;
+}
+
+button.loading {
+  position: relative;
+  color: transparent;
   pointer-events: none;
+}
+
+button.loading::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 14px;
+  height: 14px;
+  margin: -7px 0 0 -7px;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.loading-spinner {
+  width: 40px;
+  height: 40px;
+  border: 3px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
 }

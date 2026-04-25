@@ -1,84 +1,95 @@
-# llama-manager
+# Llama Manager
+
+[![Apache License 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
 
 一个简洁的 Web 管理工具，用于在 Windows 上启动和管理多个 `llama-server` 实例。
 
-## 功能
+## 功能特性
 
-- 启动多个 `llama-server` 实例
-- 查看实例状态（PID、启动命令、运行状态）
-- 支持编辑已有实例配置，保存后自动重启实例
-- 支持启用/禁用实例（禁用后可再次启用）
-- 实时查看实例日志
-- 支持日志放大查看
-- 参数配置支持：
-  - 文本方式（自由输入命令参数）
-  - 可视化方式（模型路径、host/port、线程、上下文、GPU layers、动态扩展参数）
-- 支持在指定目录下扫描多个 llama-server 版本并在界面选择
-- 支持在指定目录下扫描模型文件并在界面选择
-- 同时支持手工输入目录或可执行文件路径
-- 同时支持手工输入模型路径
-- 版本和模型扫描由后台自动进行（无需手动触发）
-- 支持局域网访问（默认监听 `0.0.0.0`）
-- 界面简洁，适合本地运维管理
+- 启动和管理多个 `llama-server` 实例
+- 实时查看实例状态（PID、启动命令、运行状态）
+- 实例配置编辑，保存后自动重启
+- 实例启用/禁用控制
+- 实时日志查看，支持全屏放大
+- 双模式参数配置：
+  - 可视化方式（模型路径、Host、Port、Threads、Context Size、GPU Layers）
+  - 自由文本方式（支持任意命令行参数）
+- 自动扫描并列出可用 llama-server 版本
+- 自动扫描并列出可用模型文件
+- 支持局域网访问
 
-## 运行
+## 快速开始
 
-> 建议在 Windows 上运行该工具，以便直接管理本机 `llama-server.exe` 进程。
+### 环境要求
 
-1. 安装 Python 3.10+
-2. 安装依赖：
+- Python 3.10+
+- Windows 系统（推荐）
+
+### 安装
 
 ```bash
+# 克隆项目
+git clone https://github.com/leaves615/llama-manager.git
+cd llama-manager
+
+# 安装依赖
 pip install -r requirements.txt
 ```
 
-3. 启动服务：
+### 运行
 
 ```bash
+# 启动应用（会自动检查并启动守护进程）
 python app.py
 ```
 
-默认地址：
+**说明**：守护进程独立运行，重启 Web UI 不会影响正在运行的 llama-server 实例。
 
-- 本机: `http://127.0.0.1:8787`
-- 局域网: `http://<你的局域网IP>:8787`
+访问地址：
+- 本机: http://127.0.0.1:8787
+- 局域网: http://<你的IP>:8787
 
-可通过环境变量改监听地址和端口：
+### 环境变量配置
 
 ```bash
+# 自定义监听地址和端口
 set LLAMA_MANAGER_HOST=0.0.0.0
 set LLAMA_MANAGER_PORT=8787
 python app.py
 ```
 
-## 使用说明
+## 使用指南
 
-1. 填写 `llama-server` 所在目录，例如：
-  - `C:\\llama`
-  - 或直接填写可执行文件路径：`C:\\llama\\llama-server-v2.exe`
-2. 按需填写可视化参数（模型、host、port、线程等）
-3. 在自由文本参数中补充高级参数
-4. 点击 `命令预览` 确认最终命令
-5. 点击 `创建实例` 启动
-6. 主界面为左侧实例列表、右侧日志查看
-7. 点击 `添加实例` 打开弹窗，填写参数后创建实例
-8. 点击实例卡片 `编辑` 打开弹窗，修改后点击 `保存并重启`
-8. 点击实例卡片中的 `启用/禁用` 可快速控制实例状态
-9. 在日志面板点击 `放大查看` 可以全屏查看日志
-10. llama 版本列表会由后台自动刷新，并在下拉框列出可选版本
-11. 模型列表会由后台自动刷新，并在下拉框列出可选模型
-12. 额外参数每一条都可单独启用/禁用
+### 创建实例
 
-## 扫描目录配置
+1. 点击左侧「添加实例」按钮
+2. 填写 llama-server 所在目录或直接选择扫描到的版本
+3. 选择模型文件或手动输入模型路径
+4. 配置服务器参数（Host、Port、Threads、Context Size、GPU Layers）
+5. 如需要可添加额外参数
+6. 点击「命令预览」确认命令
+7. 点击「创建实例」启动
 
-在项目根目录编辑 `config.yaml`：
+### 管理实例
+
+- **查看日志**: 点击实例卡片中的「查看日志」
+- **编辑配置**: 点击「编辑」修改参数，保存后自动重启
+- **启用/禁用**: 点击「启用/禁用」控制实例状态
+- **日志放大**: 点击日志面板的 ⛶ 按钮全屏查看
+
+## 配置说明
+
+编辑 `config.yaml` 自定义扫描配置：
 
 ```yaml
+# llama-server 版本扫描配置
 scan_roots:
   - "C:\\llama"
   - "D:\\llama-builds"
 scan_max_depth: 5
 scan_interval_seconds: 30
+
+# 模型文件扫描配置
 model_scan_roots:
   - "D:\\models"
 model_scan_max_depth: 5
@@ -87,16 +98,26 @@ model_extensions:
   - ".bin"
 ```
 
-- `scan_roots`: 版本扫描根目录列表（可配置多个）
-- `scan_max_depth`: 递归扫描深度
-- `scan_interval_seconds`: 后台自动扫描间隔（秒）
-- `model_scan_roots`: 模型扫描根目录列表（可配置多个）
-- `model_scan_max_depth`: 模型递归扫描深度
-- `model_extensions`: 模型文件后缀白名单
+| 配置项 | 说明 |
+|--------|------|
+| `scan_roots` | llama-server 版本扫描目录列表 |
+| `scan_max_depth` | 递归扫描深度 |
+| `scan_interval_seconds` | 自动扫描间隔（秒） |
+| `model_scan_roots` | 模型文件扫描目录列表 |
+| `model_scan_max_depth` | 模型扫描深度 |
+| `model_extensions` | 模型文件后缀白名单 |
 
-## 注意事项
+## 技术栈
 
-- 首次使用局域网访问时，请确保 Windows 防火墙放行对应端口。
-- `llama-server` 参数随版本可能变化，请根据你的版本调整参数。
-- 当前日志采用内存缓存 + 文件落盘，日志文件位于 `logs/` 目录。
-- 实例配置会持久化到 SQLite 数据库 `instances.db`，管理服务重启后仍可在实例列表中看到历史实例配置与状态。
+- **后端**: Python Flask
+- **前端**: 原生 HTML/CSS/JavaScript
+- **数据库**: SQLite
+- **协议**: Apache License 2.0
+
+## 许可证
+
+本项目基于 [Apache License 2.0](LICENSE) 开源。
+
+---
+
+Copyright © 2026 leaves615

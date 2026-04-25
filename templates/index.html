@@ -7,6 +7,9 @@
     <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
   </head>
   <body>
+    <div id="loading" class="loading hidden">
+      <div class="loading-spinner"></div>
+    </div>
     <main class="layout-two">
       <section class="panel list-panel">
         <div class="list-header">
@@ -16,7 +19,15 @@
             <button id="refreshBtn" type="button">刷新</button>
           </div>
         </div>
+        <div class="daemon-panel">
+          <div class="daemon-info">
+            <span id="daemonStatus" class="daemon-status">检测中...</span>
+            <span class="daemon-label">守护进程</span>
+          </div>
+          <button id="daemonToggleBtn" type="button" class="small">启动</button>
+        </div>
         <div id="instances" class="instances"></div>
+        <footer class="site-footer">&copy; 2024 leaves615</footer>
       </section>
 
       <section class="panel log-panel">
@@ -164,9 +175,5 @@
     </template>
 
     <script src="{{ url_for('static', filename='app.js') }}"></script>
-
-    <footer class="site-footer">
-      &copy; 2026 leaves615
-    </footer>
   </body>
 </html>

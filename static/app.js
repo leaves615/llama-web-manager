@@ -29,13 +29,38 @@ const els = {
   saveFormBtn: document.getElementById("saveFormBtn"),
   previewText: document.getElementById("previewText"),
   freeform: document.getElementById("freeform"),
+  daemonStatus: document.getElementById("daemonStatus"),
+  daemonToggleBtn: document.getElementById("daemonToggleBtn"),
+  loading: document.getElementById("loading"),
 };
 
 let selectedInstanceId = null;
 let logStream = null;
 let editingInstanceId = null;
-let discoveryTimer = null;
 let lastAutoFilledName = "";
+let loadingCount = 0;
+let daemonStream = null;
+
+function showLoading(btn) {
+  if (btn) {
+    btn.classList.add("loading");
+  } else {
+    loadingCount++;
+    els.loading.classList.remove("hidden");
+  }
+}
+
+function hideLoading(btn) {
+  if (btn) {
+    btn.classList.remove("loading");
+  } else {
+    loadingCount--;
+    if (loadingCount <= 0) {
+      loadingCount = 0;
+      els.loading.classList.add("hidden");
+    }
+  }
+}
 
 function isRunningStatus(status) {
   return String(status || "").startsWith("running");
@@ -211,45 +236,60 @@ function startEdit(item) {
   previewCommand();
 }
 
-async function postJson(url, body) {
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  const data = await res.json();
-  if (!res.ok) {
-    throw new Error(data.error || "请求失败");
+async function postJson(url, body, btn) {
+  showLoading(btn);
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data.error || "请求失败");
+    }
+    return data;
+  } finally {
+    hideLoading(btn);
   }
-  return data;
 }
 
-async function putJson(url, body) {
-  const res = await fetch(url, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  const data = await res.json();
-  if (!res.ok) {
-    throw new Error(data.error || "更新失败");
+async function putJson(url, body, btn) {
+  showLoading(btn);
+  try {
+    const res = await fetch(url, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data.error || "更新失败");
+    }
+    return data;
+  } finally {
+    hideLoading(btn);
   }
-  return data;
 }
 
-async function deleteReq(url) {
-  const res = await fetch(url, { method: "DELETE" });
-  const data = await res.json();
-  if (!res.ok) {
-    throw new Error(data.error || "删除失败");
+async function deleteReq(url, btn) {
+  showLoading(btn);
+  try {
+    const res = await fetch(url, { method: "DELETE" });
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data.error || "删除失败");
+    }
+    return data;
+  } finally {
+    hideLoading(btn);
   }
-  return data;
 }
 
 async function previewCommand() {
   try {
     const payload = collectPayload();
-    const data = await postJson("/api/command-preview", payload);
+    const data = await postJson("/api/command-preview", payload, els.previewBtn);
     els.previewText.textContent = data.command.join(" ");
   } catch (e) {
     els.previewText.textContent = `错误：${e.message}`;
@@ -261,9 +301,9 @@ async function saveForm() {
     const payload = collectPayload();
     let instance;
     if (editingInstanceId) {
-      instance = await putJson(`/api/instances/${editingInstanceId}`, payload);
+      instance = await putJson(`/api/instances/${editingInstanceId}`, payload, els.saveFormBtn);
     } else {
-      instance = await postJson("/api/instances", payload);
+      instance = await postJson("/api/instances", payload, els.saveFormBtn);
     }
     closeFormModal();
     await refreshInstances();
@@ -275,12 +315,12 @@ async function saveForm() {
   }
 }
 
-async function toggleInstance(item) {
+async function toggleInstance(item, btn) {
   try {
     if (isRunningStatus(item.status)) {
-      await deleteReq(`/api/instances/${item.instance_id}`);
+      await deleteReq(`/api/instances/${item.instance_id}`, btn);
     } else {
-      await postJson(`/api/instances/${item.instance_id}/start`, {});
+      await postJson(`/api/instances/${item.instance_id}/start`, {}, btn);
     }
     await refreshInstances();
   } catch (e) {
@@ -360,7 +400,7 @@ function renderInstances(items) {
 
   els.instances.innerHTML = "";
   items.forEach((item) => {
-    const toggleText = isRunningStatus(item.status) ? "禁用" : "启用";
+    const toggleText = isRunningStatus(item.status) ? "停止" : "启动";
     const toggleClass = isRunningStatus(item.status) ? "danger" : "primary";
     const activeClass = item.instance_id === selectedInstanceId ? " selected" : "";
     const card = document.createElement("div");
@@ -382,8 +422,8 @@ function renderInstances(items) {
     card.querySelector(".edit").addEventListener("click", () => {
       startEdit(item);
     });
-    card.querySelector(".toggle").addEventListener("click", async () => {
-      await toggleInstance(item);
+    card.querySelector(".toggle").addEventListener("click", async (e) => {
+      await toggleInstance(item, e.target);
     });
 
     els.instances.appendChild(card);
@@ -395,9 +435,14 @@ function renderInstances(items) {
 }
 
 async function refreshInstances() {
-  const res = await fetch("/api/instances");
-  const data = await res.json();
-  renderInstances(data.items || []);
+  showLoading();
+  try {
+    const res = await fetch("/api/instances");
+    const data = await res.json();
+    renderInstances(data.items || []);
+  } finally {
+    hideLoading();
+  }
 }
 
 function startLogStream(instanceId) {
@@ -537,7 +582,51 @@ populateContextSizeOptions();
 clearForm();
 refreshInstances();
 refreshAutoDiscoveries();
-if (discoveryTimer) {
-  clearInterval(discoveryTimer);
+initDaemonStatusStream();
+
+function initDaemonStatusStream() {
+  if (daemonStream) {
+    daemonStream.close();
+  }
+  daemonStream = new EventSource("/api/daemon/status/stream");
+  daemonStream.addEventListener("status", (event) => {
+    try {
+      const data = JSON.parse(event.data || "{}");
+      if (data.running) {
+        els.daemonStatus.textContent = "运行中";
+        els.daemonStatus.className = "daemon-status running";
+        els.daemonToggleBtn.textContent = "停止";
+      } else {
+        els.daemonStatus.textContent = "未运行";
+        els.daemonStatus.className = "daemon-status stopped";
+        els.daemonToggleBtn.textContent = "启动";
+      }
+    } catch (_e) {}
+  });
+  daemonStream.addEventListener("instances", (event) => {
+    try {
+      const data = JSON.parse(event.data || "{}");
+      renderInstances(data.items || []);
+    } catch (_e) {}
+  });
+  daemonStream.onerror = () => {
+    setTimeout(initDaemonStatusStream, 5000);
+  };
 }
-discoveryTimer = setInterval(refreshAutoDiscoveries, 30000);
+
+els.daemonToggleBtn.addEventListener("click", async (e) => {
+  const isRunning = els.daemonToggleBtn.textContent === "停止";
+  showLoading(e.target);
+  try {
+    const url = isRunning ? "/api/daemon/stop" : "/api/daemon/start";
+    const res = await fetch(url, { method: "POST" });
+    const data = await res.json();
+    if (data.error) {
+      alert(data.error);
+    }
+  } catch (_e) {
+    alert(isRunning ? "停止失败" : "启动失败");
+  } finally {
+    hideLoading(e.target);
+  }
+});
