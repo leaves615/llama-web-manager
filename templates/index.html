@@ -1,179 +1,75 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Llama Server Manager</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
+    <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+    <style>
+      [v-cloak] { display: none; }
+    </style>
   </head>
   <body>
-    <div id="loading" class="loading hidden">
-      <div class="loading-spinner"></div>
-    </div>
-    <main class="layout-two">
-      <section class="panel list-panel">
-        <div class="list-header">
-          <h1>实例列表</h1>
-          <div class="header-actions">
-            <button id="addInstanceBtn" type="button" class="primary">添加实例</button>
-            <button id="refreshBtn" type="button">刷新</button>
-          </div>
-        </div>
-        <div class="daemon-panel">
-          <div class="daemon-info">
-            <span id="daemonStatus" class="daemon-status">检测中...</span>
-            <span class="daemon-label">守护进程</span>
-          </div>
-          <button id="daemonToggleBtn" type="button" class="small">启动</button>
-        </div>
-        <div id="instances" class="instances"></div>
-        <footer class="site-footer">&copy; 2024 leaves615</footer>
-      </section>
-
-      <section class="panel log-panel">
-        <div class="list-header">
-          <h2>日志查看</h2>
-          <div class="log-head-actions">
-            <span id="currentInstance">未选择实例</span>
-            <button id="enlargeLogBtn" type="button" title="放大查看">⛶</button>
-          </div>
-        </div>
-        <pre id="logOutput" class="log-output">请选择左侧实例以查看日志...</pre>
-      </section>
-    </main>
-
-    <div id="formModal" class="form-modal hidden">
-      <div class="form-modal-card">
-        <div class="form-modal-head">
-          <strong id="formModalTitle">添加实例</strong>
-          <button id="closeFormModalBtn" type="button">✕</button>
-        </div>
-
-        <div class="form-modal-body">
-          <div class="form-section">
-            <div class="section-title">实例信息</div>
-            <div class="form-grid">
-              <div class="form-group">
-                <label>实例名称</label>
-                <input id="name" placeholder="例如: qa-model-a" />
-              </div>
-              <div class="form-group">
-                <label>llama 启动路径</label>
-                <input id="server_dir" placeholder="目录或可执行文件" />
-              </div>
-              <div class="form-group full-width">
-                <label>或选择扫描版本</label>
-                <select id="version_select">
-                  <option value="">未扫描，或使用手工输入</option>
-                </select>
-              </div>
+    <div id="app" v-cloak>
+      <main class="layout-two">
+        <section class="panel list-panel">
+          <div class="list-header">
+            <h1>实例列表</h1>
+            <div class="header-actions">
+              <button id="addInstanceBtn" type="button" class="primary" @click="openForm(null)">添加实例</button>
+              <button id="refreshBtn" type="button" @click="refreshInstances">刷新</button>
             </div>
           </div>
+          
+          <daemon-panel 
+            :status="daemonStatus" 
+            @toggle="toggleDaemon"
+            :loading="daemonLoading"
+          ></daemon-panel>
+          
+          <instance-list
+            :instances="instances"
+            :selected-id="selectedInstanceId"
+            :loading-ids="loadingIds"
+            @select="selectInstance"
+            @edit="openForm"
+            @toggle="toggleInstance"
+          ></instance-list>
+          
+          <footer class="site-footer">&copy; 2024 leaves615</footer>
+        </section>
 
-          <div class="form-section">
-            <div class="section-title">模型配置</div>
-            <div class="form-grid">
-              <div class="form-group">
-                <label>Model 路径</label>
-                <input id="model_path" placeholder="例如: D:\models\qwen.gguf" />
-              </div>
-              <div class="form-group">
-                <label>或选择扫描模型</label>
-                <select id="model_select">
-                  <option value="">未扫描，或使用手工输入</option>
-                </select>
-              </div>
+        <section class="panel log-panel">
+          <div class="list-header">
+            <h2>日志查看</h2>
+            <div class="log-head-actions">
+              <span id="currentInstance">{{ currentInstanceName }}</span>
+              <button id="enlargeLogBtn" type="button" title="放大查看" @click="showLogLarge = true">⛶</button>
             </div>
           </div>
+          <log-viewer
+            :logs="currentLogs"
+            :loading="logLoading"
+          ></log-viewer>
+        </section>
+      </main>
 
-          <div class="form-section">
-            <div class="section-title">服务器配置</div>
-            <div class="form-grid four">
-              <div class="form-group">
-                <label>Host</label>
-                <input id="host" value="0.0.0.0" />
-              </div>
-              <div class="form-group">
-                <label>Port</label>
-                <input id="port" type="number" value="8080" />
-              </div>
-              <div class="form-group">
-                <label>Threads</label>
-                <input id="n_threads" type="number" value="8" />
-              </div>
-              <div class="form-group">
-                <label>GPU Layers</label>
-                <input id="gpu_layers" type="number" value="0" />
-              </div>
-            </div>
-            <div class="form-grid">
-              <div class="form-group">
-                <label>Context Size</label>
-                <div class="ctx-size-wrap">
-                  <select id="n_ctx_select">
-                    <option value="2048">2K</option>
-                    <option value="4096">4K</option>
-                    <option value="8192">8K</option>
-                    <option value="16384">16K</option>
-                    <option value="32768" selected>32K</option>
-                    <option value="65536">64K</option>
-                    <option value="131072">128K</option>
-                    <option value="262144">256K</option>
-                    <option value="524288">512K</option>
-                    <option value="1048576">1M</option>
-                  </select>
-                </div>
-              </div>
-            </div>
-          </div>
+      <instance-form
+        v-if="showForm"
+        :instance="editingInstance"
+        :loading="formLoading"
+        @save="saveForm"
+        @close="showForm = false"
+      ></instance-form>
 
-          <div class="form-section">
-            <div class="section-title">
-              额外参数
-              <button id="addFlag" type="button" class="small">+ 添加</button>
-            </div>
-            <div id="flagRows"></div>
-          </div>
-
-          <div class="form-section">
-            <div class="section-title">自由文本参数</div>
-            <textarea id="freeform" rows="2" placeholder="例如: --temp 0.7 --top-p 0.9"></textarea>
-          </div>
-
-          <div class="form-actions">
-            <button id="previewBtn" type="button">命令预览</button>
-            <button id="saveFormBtn" type="button" class="primary">创建实例</button>
-          </div>
-
-          <div class="preview">
-            <div class="preview-label">命令预览</div>
-            <pre id="previewText">尚未生成</pre>
-          </div>
-        </div>
-      </div>
+      <log-modal
+        v-if="showLogLarge"
+        :logs="currentLogs"
+        @close="showLogLarge = false"
+      ></log-modal>
     </div>
 
-    <div id="logModal" class="log-modal hidden">
-      <div class="log-modal-card">
-        <div class="log-modal-head">
-          <strong>日志放大查看</strong>
-          <button id="closeLogModalBtn" type="button">✕</button>
-        </div>
-        <pre id="logOutputLarge" class="log-output-large">暂无日志</pre>
-      </div>
-    </div>
-
-    <template id="flagRowTemplate">
-      <div class="flag-row">
-        <input class="flag-key" placeholder="--temp" />
-        <input class="flag-value" placeholder="0.8" />
-        <label class="flag-enable">
-          <input type="checkbox" class="flag-enabled" checked />启用
-        </label>
-        <button type="button" class="danger small remove-row">删除</button>
-      </div>
-    </template>
-
-    <script src="{{ url_for('static', filename='app.js') }}"></script>
+    <script src="{{ url_for('static', filename='main.js') }}"></script>
   </body>
 </html>

@@ -1073,7 +1073,7 @@ def create_instance():
         return jsonify({"error": str(e)}), 400
 
 
-@app.delete("/api/instances/<instance_id>")
+@app.post("/api/instances/<instance_id>/stop")
 def stop_instance(instance_id: str):
     try:
         data = manager.stop_instance(instance_id)

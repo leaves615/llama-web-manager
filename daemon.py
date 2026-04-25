@@ -225,12 +225,16 @@ class DaemonManager:
     def process_commands(self):
         cursor = self._db_execute("SELECT * FROM instances WHERE command = 'start'")
         rows = cursor.fetchall()
+        print(f"[Daemon] Found {len(rows)} instances with command='start'")
         for row in rows:
+            print(f"[Daemon] Processing start for: {row['instance_id']}")
             self._start_instance(row)
 
         cursor = self._db_execute("SELECT * FROM instances WHERE command = 'stop'")
         rows = cursor.fetchall()
+        print(f"[Daemon] Found {len(rows)} instances with command='stop'")
         for row in rows:
+            print(f"[Daemon] Processing stop for: {row['instance_id']}")
             self._stop_instance(row)
 
     def _start_instance(self, row):
