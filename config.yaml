@@ -1,0 +1,10 @@
+scan_roots:
+  - C:\Users\eddy\tools
+scan_max_depth: 5
+scan_interval_seconds: 30
+model_scan_roots:
+  - C:\Users\eddy\.lmstudio\models
+model_scan_max_depth: 5
+model_extensions:
+  - .gguf
+  - .bin

@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Llama Server Manager</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
+  </head>
+  <body>
+    <main class="layout-two">
+      <section class="panel list-panel">
+        <div class="list-header">
+          <h1>实例列表</h1>
+          <div class="header-actions">
+            <button id="addInstanceBtn" type="button" class="primary">添加实例</button>
+            <button id="refreshBtn" type="button">刷新</button>
+          </div>
+        </div>
+        <div id="instances" class="instances"></div>
+      </section>
+
+      <section class="panel log-panel">
+        <div class="list-header">
+          <h2>日志查看</h2>
+          <div class="log-head-actions">
+            <span id="currentInstance">未选择实例</span>
+            <button id="enlargeLogBtn" type="button">放大查看</button>
+          </div>
+        </div>
+        <pre id="logOutput" class="log-output">请选择左侧实例以查看日志...</pre>
+      </section>
+    </main>
+
+    <div id="formModal" class="form-modal hidden">
+      <div class="form-modal-card">
+        <div class="form-modal-head">
+          <strong id="formModalTitle">添加实例</strong>
+          <button id="closeFormModalBtn" type="button">关闭</button>
+        </div>
+
+        <div class="form-modal-body">
+          <label>实例名称
+            <input id="name" placeholder="例如: qa-model-a" />
+          </label>
+
+          <label>llama 启动路径（目录或可执行文件，支持手工输入）
+            <input id="server_dir" placeholder="例如: C:\\llama 或 C:\\llama\\llama-server-v2.exe" />
+          </label>
+
+          <div class="scan-box">
+            <div class="scan-hint">版本扫描由后台自动进行（配置见 config.yaml）</div>
+            <label>扫描结果（可选择）
+              <select id="version_select">
+                <option value="">未扫描，或使用手工输入</option>
+              </select>
+            </label>
+          </div>
+
+          <fieldset>
+            <legend>可视化参数配置</legend>
+            <div class="grid two">
+              <label>Model 路径
+                <input id="model_path" placeholder="例如: D:\\models\\qwen.gguf" />
+              </label>
+              <label>Model 扫描结果（可选择）
+                <select id="model_select">
+                  <option value="">未扫描，或使用手工输入</option>
+                </select>
+              </label>
+              <label>Host
+                <input id="host" value="0.0.0.0" />
+              </label>
+              <label>Port
+                <input id="port" type="number" value="8080" />
+              </label>
+              <label>Context Size (--ctx-size)
+                <div class="ctx-size-wrap">
+                  <input id="n_ctx" type="text" value="4096" />
+                  <select id="n_ctx_select">
+                    <option value="">下拉选择常用值</option>
+                  </select>
+                </div>
+              </label>
+              <label>Threads (--threads)
+                <input id="n_threads" type="number" value="8" />
+              </label>
+              <label>GPU Layers (--n-gpu-layers)
+                <input id="gpu_layers" type="number" value="0" />
+              </label>
+            </div>
+
+
+            <div class="scan-hint">模型扫描由后台自动进行（配置见 config.yaml）</div>
+
+            <div class="extra-flags">
+              <div class="extra-head">
+                <strong>额外参数（可视化）</strong>
+                <button id="addFlag" type="button">+ 添加</button>
+              </div>
+              <div id="flagRows"></div>
+            </div>
+          </fieldset>
+
+          <label>自由文本参数
+            <textarea id="freeform" rows="3" placeholder="例如: --temp 0.7 --top-p 0.9"></textarea>
+          </label>
+
+          <div class="actions">
+            <button id="previewBtn" type="button">命令预览</button>
+            <button id="saveFormBtn" type="button" class="primary">创建实例</button>
+          </div>
+
+          <div class="preview">
+            <div class="label">命令预览</div>
+            <pre id="previewText">尚未生成</pre>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="logModal" class="log-modal hidden">
+      <div class="log-modal-card">
+        <div class="log-modal-head">
+          <strong>日志放大查看</strong>
+          <button id="closeLogModalBtn" type="button">关闭</button>
+        </div>
+        <pre id="logOutputLarge" class="log-output-large">暂无日志</pre>
+      </div>
+    </div>
+
+    <template id="flagRowTemplate">
+      <div class="flag-row">
+        <input class="flag-key" placeholder="参数名，例如: --temp" />
+        <input class="flag-value" placeholder="参数值，例如: 0.8 (可留空)" />
+        <label class="flag-enable">
+          <input type="checkbox" class="flag-enabled" checked />启用
+        </label>
+        <button type="button" class="danger remove-row">删除</button>
+      </div>
+    </template>
+
+    <script src="{{ url_for('static', filename='app.js') }}"></script>
+  </body>
+</html>

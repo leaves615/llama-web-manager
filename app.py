@@ -1,0 +1,1093 @@
+import datetime as dt
+import json
+import os
+import re
+import shlex
+import sqlite3
+import subprocess
+import threading
+import time
+import uuid
+from collections import deque
+from pathlib import Path
+from typing import Dict, List
+
+from flask import Flask, Response, jsonify, render_template, request, stream_with_context
+import yaml
+
+
+APP_ROOT = Path(__file__).parent
+LOG_DIR = APP_ROOT / "logs"
+DB_FILE = APP_ROOT / "instances.db"
+CONFIG_FILE = APP_ROOT / "config.yaml"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def utc_now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def load_runtime_config() -> Dict:
+    default_cfg = {
+        "scan_roots": [],
+        "scan_max_depth": 5,
+        "scan_interval_seconds": 30,
+        "model_scan_roots": [],
+        "model_scan_max_depth": 5,
+        "model_extensions": [".gguf", ".bin"],
+    }
+    if not CONFIG_FILE.exists():
+        return default_cfg
+
+    try:
+        raw = yaml.safe_load(CONFIG_FILE.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return default_cfg
+        roots = raw.get("scan_roots", [])
+        depth = raw.get("scan_max_depth", 5)
+        scan_interval = raw.get("scan_interval_seconds", 30)
+        model_roots = raw.get("model_scan_roots", roots)
+        model_depth = raw.get("model_scan_max_depth", depth)
+        model_exts = raw.get("model_extensions", [".gguf", ".bin"])
+        if not isinstance(roots, list):
+            roots = []
+        if not isinstance(depth, int) or depth <= 0:
+            depth = 5
+        if not isinstance(scan_interval, int) or scan_interval <= 0:
+            scan_interval = 30
+        if not isinstance(model_roots, list):
+            model_roots = []
+        if not isinstance(model_depth, int) or model_depth <= 0:
+            model_depth = depth
+        if not isinstance(model_exts, list) or not model_exts:
+            model_exts = [".gguf", ".bin"]
+
+        normalized_exts = []
+        for ext in model_exts:
+            text = str(ext).strip().lower()
+            if not text:
+                continue
+            if not text.startswith("."):
+                text = f".{text}"
+            normalized_exts.append(text)
+
+        return {
+            "scan_roots": [str(x).strip() for x in roots if str(x).strip()],
+            "scan_max_depth": depth,
+            "scan_interval_seconds": scan_interval,
+            "model_scan_roots": [str(x).strip() for x in model_roots if str(x).strip()],
+            "model_scan_max_depth": model_depth,
+            "model_extensions": sorted(set(normalized_exts)),
+        }
+    except Exception:
+        return default_cfg
+
+
+class InstanceRecord:
+    def __init__(
+        self,
+        instance_id: str,
+        name: str,
+        executable_path: str,
+        command: List[str],
+        process: subprocess.Popen,
+        log_file: Path,
+        visual_args: Dict,
+        freeform_args: str,
+        created_at: str | None = None,
+    ) -> None:
+        self.instance_id = instance_id
+        self.name = name
+        self.executable_path = executable_path
+        self.command = command
+        self.process = process
+        self.log_file = log_file
+        self.visual_args = visual_args
+        self.freeform_args = freeform_args
+        self.created_at = created_at or utc_now_iso()
+        self.stopped_by_manager = False
+        self.logs = deque(maxlen=3000)
+        self._lock = threading.Lock()
+
+    def append_log(self, line: str) -> None:
+        with self._lock:
+            self.logs.append(line)
+
+    def get_logs(self, lines: int = 200) -> List[str]:
+        with self._lock:
+            if lines <= 0:
+                return []
+            return list(self.logs)[-lines:]
+
+    @property
+    def pid(self) -> int:
+        return self.process.pid
+
+    @property
+    def status(self) -> str:
+        return "running" if self.process.poll() is None else f"exited({self.process.returncode})"
+
+
+class InstanceManager:
+    def __init__(self) -> None:
+        self.instances: Dict[str, InstanceRecord] = {}
+        self._lock = threading.Lock()
+        self._db_lock = threading.Lock()
+        self._init_db()
+
+    def _db_conn(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(DB_FILE)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _init_db(self) -> None:
+        with self._db_lock:
+            with self._db_conn() as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS instances (
+                        instance_id TEXT PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        executable_path TEXT NOT NULL,
+                        command_json TEXT NOT NULL,
+                        visual_args_json TEXT NOT NULL,
+                        freeform_args TEXT NOT NULL,
+                        log_file TEXT NOT NULL,
+                        pid INTEGER,
+                        status TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+
+    def _upsert_instance(
+        self,
+        *,
+        instance_id: str,
+        name: str,
+        executable_path: str,
+        command: List[str],
+        visual_args: Dict,
+        freeform_args: str,
+        log_file: Path,
+        pid: int | None,
+        status: str,
+        created_at: str,
+    ) -> None:
+        now = utc_now_iso()
+        with self._db_lock:
+            with self._db_conn() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO instances (
+                        instance_id, name, executable_path, command_json, visual_args_json,
+                        freeform_args, log_file, pid, status, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(instance_id) DO UPDATE SET
+                        name=excluded.name,
+                        executable_path=excluded.executable_path,
+                        command_json=excluded.command_json,
+                        visual_args_json=excluded.visual_args_json,
+                        freeform_args=excluded.freeform_args,
+                        log_file=excluded.log_file,
+                        pid=excluded.pid,
+                        status=excluded.status,
+                        updated_at=excluded.updated_at
+                    """,
+                    (
+                        instance_id,
+                        name,
+                        executable_path,
+                        json.dumps(command, ensure_ascii=False),
+                        json.dumps(visual_args, ensure_ascii=False),
+                        freeform_args,
+                        str(log_file),
+                        pid,
+                        status,
+                        created_at,
+                        now,
+                    ),
+                )
+
+    def _update_instance_status(self, instance_id: str, pid: int | None, status: str) -> None:
+        with self._db_lock:
+            with self._db_conn() as conn:
+                conn.execute(
+                    "UPDATE instances SET pid = ?, status = ?, updated_at = ? WHERE instance_id = ?",
+                    (pid, status, utc_now_iso(), instance_id),
+                )
+
+    def _list_persisted_instances(self) -> List[Dict]:
+        with self._db_lock:
+            with self._db_conn() as conn:
+                rows = conn.execute(
+                    "SELECT * FROM instances ORDER BY datetime(updated_at) DESC"
+                ).fetchall()
+
+        items: List[Dict] = []
+        for row in rows:
+            items.append(
+                {
+                    "instance_id": row["instance_id"],
+                    "name": row["name"],
+                    "executable_path": row["executable_path"],
+                    "pid": row["pid"],
+                    "status": row["status"],
+                    "created_at": row["created_at"],
+                    "command": json.loads(row["command_json"]),
+                    "log_file": row["log_file"],
+                    "visual_args": json.loads(row["visual_args_json"]),
+                    "freeform_args": row["freeform_args"],
+                }
+            )
+        return items
+
+    def _get_persisted_instance(self, instance_id: str) -> Dict | None:
+        with self._db_lock:
+            with self._db_conn() as conn:
+                row = conn.execute(
+                    "SELECT * FROM instances WHERE instance_id = ?",
+                    (instance_id,),
+                ).fetchone()
+
+        if not row:
+            return None
+
+        return {
+            "instance_id": row["instance_id"],
+            "name": row["name"],
+            "executable_path": row["executable_path"],
+            "pid": row["pid"],
+            "status": row["status"],
+            "created_at": row["created_at"],
+            "command": json.loads(row["command_json"]),
+            "log_file": row["log_file"],
+            "visual_args": json.loads(row["visual_args_json"]),
+            "freeform_args": row["freeform_args"],
+        }
+
+    def _start_process(self, command: List[str]) -> subprocess.Popen:
+        creationflags = 0
+        if os.name == "nt":
+            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+
+        return subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            creationflags=creationflags,
+        )
+
+    def _terminate_process(self, record: InstanceRecord) -> None:
+        record.stopped_by_manager = True
+        if record.process.poll() is None:
+            record.process.terminate()
+            try:
+                record.process.wait(timeout=8)
+            except subprocess.TimeoutExpired:
+                record.process.kill()
+
+    def _read_log_file_tail(self, file_path: str, lines: int) -> List[str]:
+        path = Path(file_path)
+        if not path.exists() or lines <= 0:
+            return []
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            return [line.rstrip("\n") for line in f.readlines()[-lines:]]
+
+    def _resolve_executable(self, server_dir: str) -> str:
+        raw = (server_dir or "").strip()
+        if not raw:
+            raise ValueError("server_dir 不能为空")
+
+        path = Path(raw)
+        if path.is_file():
+            return str(path)
+
+        if not path.is_dir():
+            raise ValueError(f"未找到目录: {server_dir}")
+
+        exe_name = "llama-server.exe" if os.name == "nt" else "llama-server"
+        candidate = path / exe_name
+        if not candidate.exists():
+            raise ValueError(f"目录中未找到可执行文件: {candidate}")
+
+        return str(candidate)
+
+    def discover_llama_binaries(self, base_dir: str, max_depth: int = 4) -> List[str]:
+        raw = (base_dir or "").strip()
+        if not raw:
+            raise ValueError("base_dir 不能为空")
+
+        root = Path(raw)
+        if not root.exists() or not root.is_dir():
+            raise ValueError(f"扫描目录不存在: {base_dir}")
+
+        def is_candidate(name: str) -> bool:
+            lower = name.lower()
+            if os.name == "nt":
+                return lower.startswith("llama-server") and lower.endswith(".exe")
+            return lower.startswith("llama-server")
+
+        found: List[str] = []
+        root_depth = len(root.parts)
+
+        for current, dirs, files in os.walk(root):
+            current_path = Path(current)
+            depth = len(current_path.parts) - root_depth
+            if depth >= max_depth:
+                dirs[:] = []
+
+            for fname in files:
+                if not is_candidate(fname):
+                    continue
+                fpath = current_path / fname
+                if os.name != "nt" and not os.access(fpath, os.X_OK):
+                    continue
+                found.append(str(fpath))
+
+        # 去重并按路径排序，保证前端显示稳定。
+        unique_sorted = sorted(set(found), key=lambda p: p.lower())
+        return unique_sorted
+
+    def discover_model_files(
+        self,
+        base_dir: str,
+        extensions: List[str],
+        max_depth: int = 5,
+    ) -> List[str]:
+        raw = (base_dir or "").strip()
+        if not raw:
+            raise ValueError("base_dir 不能为空")
+
+        root = Path(raw)
+        if not root.exists() or not root.is_dir():
+            raise ValueError(f"扫描目录不存在: {base_dir}")
+
+        normalized_exts = set()
+        for ext in extensions:
+            text = str(ext).strip().lower()
+            if not text:
+                continue
+            if not text.startswith("."):
+                text = f".{text}"
+            normalized_exts.add(text)
+
+        if not normalized_exts:
+            normalized_exts = {".gguf", ".bin"}
+
+        found: List[str] = []
+        root_depth = len(root.parts)
+        for current, dirs, files in os.walk(root):
+            current_path = Path(current)
+            depth = len(current_path.parts) - root_depth
+            if depth >= max_depth:
+                dirs[:] = []
+
+            for fname in files:
+                suffix = Path(fname).suffix.lower()
+                if suffix not in normalized_exts:
+                    continue
+                found.append(str(current_path / fname))
+
+        return sorted(set(found), key=lambda p: p.lower())
+
+    def list_instances(self) -> List[Dict]:
+        with self._lock:
+            running = {record.instance_id: self._serialize(record) for record in self.instances.values()}
+
+        persisted = self._list_persisted_instances()
+        merged: List[Dict] = []
+        seen = set()
+        for item in persisted:
+            rid = item["instance_id"]
+            merged.append(running.get(rid, item))
+            seen.add(rid)
+
+        for rid, item in running.items():
+            if rid not in seen:
+                merged.append(item)
+
+        return merged
+
+    def get_instance(self, instance_id: str) -> InstanceRecord | None:
+        with self._lock:
+            return self.instances.get(instance_id)
+
+    def create_instance(
+        self,
+        name: str,
+        server_dir: str,
+        visual_args: Dict,
+        freeform_args: str,
+    ) -> Dict:
+        if not server_dir:
+            raise ValueError("server_dir 不能为空")
+
+        instance_id = str(uuid.uuid4())[:8]
+        command = self._build_command(server_dir, visual_args, freeform_args)
+        log_file = LOG_DIR / f"{instance_id}.log"
+        process = self._start_process(command)
+
+        record = InstanceRecord(
+            instance_id=instance_id,
+            name=name or f"llama-{instance_id}",
+            executable_path=server_dir,
+            command=command,
+            process=process,
+            log_file=log_file,
+            visual_args=visual_args,
+            freeform_args=freeform_args,
+        )
+
+        with self._lock:
+            self.instances[instance_id] = record
+
+        self._upsert_instance(
+            instance_id=record.instance_id,
+            name=record.name,
+            executable_path=server_dir,
+            command=record.command,
+            visual_args=record.visual_args,
+            freeform_args=record.freeform_args,
+            log_file=record.log_file,
+            pid=record.pid,
+            status=record.status,
+            created_at=record.created_at,
+        )
+
+        threading.Thread(
+            target=self._capture_output,
+            args=(record,),
+            daemon=True,
+        ).start()
+
+        return self._serialize(record)
+
+    def start_instance(self, instance_id: str) -> Dict:
+        persisted = self._get_persisted_instance(instance_id)
+        if not persisted:
+            raise ValueError("实例不存在")
+
+        running = self.get_instance(instance_id)
+        if running and running.process.poll() is None:
+            return self._serialize(running)
+
+        command = self._build_command(
+            server_dir=persisted["executable_path"],
+            visual_args=persisted["visual_args"],
+            freeform_args=persisted["freeform_args"],
+        )
+        process = self._start_process(command)
+
+        record = InstanceRecord(
+            instance_id=instance_id,
+            name=persisted["name"],
+            executable_path=persisted["executable_path"],
+            command=command,
+            process=process,
+            log_file=Path(persisted["log_file"]),
+            visual_args=persisted["visual_args"],
+            freeform_args=persisted["freeform_args"],
+            created_at=persisted["created_at"],
+        )
+
+        with self._lock:
+            self.instances[instance_id] = record
+
+        self._upsert_instance(
+            instance_id=record.instance_id,
+            name=record.name,
+            executable_path=record.executable_path,
+            command=record.command,
+            visual_args=record.visual_args,
+            freeform_args=record.freeform_args,
+            log_file=record.log_file,
+            pid=record.pid,
+            status=record.status,
+            created_at=record.created_at,
+        )
+
+        threading.Thread(
+            target=self._capture_output,
+            args=(record,),
+            daemon=True,
+        ).start()
+
+        return self._serialize(record)
+
+    def update_instance(
+        self,
+        instance_id: str,
+        name: str,
+        server_dir: str,
+        visual_args: Dict,
+        freeform_args: str,
+    ) -> Dict:
+        if not server_dir:
+            raise ValueError("server_dir 不能为空")
+
+        persisted = self._get_persisted_instance(instance_id)
+        if not persisted:
+            raise ValueError("实例不存在")
+
+        command = self._build_command(server_dir, visual_args, freeform_args)
+        log_file = Path(persisted["log_file"])
+
+        with self._lock:
+            old_record = self.instances.get(instance_id)
+
+        if old_record:
+            self._terminate_process(old_record)
+
+        process = self._start_process(command)
+
+        record = InstanceRecord(
+            instance_id=instance_id,
+            name=name or f"llama-{instance_id}",
+            executable_path=server_dir,
+            command=command,
+            process=process,
+            log_file=log_file,
+            visual_args=visual_args,
+            freeform_args=freeform_args,
+            created_at=persisted["created_at"],
+        )
+
+        with self._lock:
+            self.instances[instance_id] = record
+
+        self._upsert_instance(
+            instance_id=record.instance_id,
+            name=record.name,
+            executable_path=record.executable_path,
+            command=record.command,
+            visual_args=record.visual_args,
+            freeform_args=record.freeform_args,
+            log_file=record.log_file,
+            pid=record.pid,
+            status=record.status,
+            created_at=record.created_at,
+        )
+
+        threading.Thread(
+            target=self._capture_output,
+            args=(record,),
+            daemon=True,
+        ).start()
+
+        return self._serialize(record)
+
+    def stop_instance(self, instance_id: str) -> Dict:
+        record = self.get_instance(instance_id)
+        if record:
+            self._terminate_process(record)
+            with self._lock:
+                self.instances.pop(instance_id, None)
+            self._update_instance_status(instance_id, None, "disabled")
+            payload = self._serialize(record)
+            payload["status"] = "disabled"
+            payload["pid"] = None
+            return payload
+
+        persisted = self._get_persisted_instance(instance_id)
+        if not persisted:
+            raise ValueError("实例不存在")
+
+        self._update_instance_status(instance_id, None, "disabled")
+        persisted["status"] = "disabled"
+        persisted["pid"] = None
+        return persisted
+
+    def _capture_output(self, record: InstanceRecord) -> None:
+        with record.log_file.open("a", encoding="utf-8") as f:
+            f.write(f"[{utc_now_iso()}] command: {' '.join(record.command)}\n")
+            stdout = record.process.stdout
+            if stdout is None:
+                return
+
+            stderr_output_lines = []
+            for line in stdout:
+                clean = line.rstrip("\n")
+                msg = f"[{utc_now_iso()}] {clean}"
+                record.append_log(msg)
+                f.write(msg + "\n")
+                f.flush()
+                stderr_output_lines.append(msg)
+
+            # 等待进程结束并获取返回码
+            return_code = record.process.poll()
+            if return_code is None:
+                try:
+                    return_code = record.process.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    return_code = -1
+                    record.process.kill()
+            
+            final_status = "disabled" if record.stopped_by_manager else f"exited({return_code})"
+            
+            ended = f"[{utc_now_iso()}] process exited with code {return_code}, status={final_status}"
+            record.append_log(ended)
+            f.write(ended + "\n")
+            
+            if not record.stopped_by_manager and return_code != 0:
+                error_msg = f"[{utc_now_iso()}] ERROR: Process exited with non-zero code {return_code}"
+                record.append_log(error_msg)
+                f.write(error_msg + "\n")
+                if stderr_output_lines:
+                    stderr_details = f"\n[{utc_now_iso()}] Process output:\n" + "\n".join(stderr_output_lines)
+                    record.append_log(stderr_details)
+                    f.write(stderr_details + "\n")
+                    f.flush()
+            else:
+                f.flush()
+            
+            final_pid = None if record.stopped_by_manager else record.pid
+            with self._lock:
+                current = self.instances.get(record.instance_id)
+                should_update = current is record or current is None
+                if current is record:
+                    self.instances.pop(record.instance_id, None)
+            if should_update:
+                self._update_instance_status(record.instance_id, final_pid, final_status)
+
+    def _build_command(self, server_dir: str, visual_args: Dict, freeform_args: str) -> List[str]:
+        executable = self._resolve_executable(server_dir)
+        cmd: List[str] = [executable]
+
+        model = (visual_args.get("model_path") or "").strip()
+        host = (visual_args.get("host") or "").strip()
+        port = visual_args.get("port")
+        n_ctx = visual_args.get("n_ctx")
+        n_threads = visual_args.get("n_threads")
+        gpu_layers = visual_args.get("gpu_layers")
+        extra_kv = visual_args.get("extra_flags") or []
+
+        if model:
+            cmd.extend(["--model", model])
+        if host:
+            cmd.extend(["--host", host])
+        if port:
+            cmd.extend(["--port", str(port)])
+        if n_ctx:
+            cmd.extend(["--ctx-size", str(n_ctx)])
+        if n_threads:
+            cmd.extend(["--threads", str(n_threads)])
+        if gpu_layers is not None and str(gpu_layers).strip() != "":
+            cmd.extend(["--n-gpu-layers", str(gpu_layers)])
+
+        for item in extra_kv:
+            enabled_raw = item.get("enabled", True)
+            enabled = enabled_raw if isinstance(enabled_raw, bool) else str(enabled_raw).strip().lower() not in {
+                "0",
+                "false",
+                "off",
+                "no",
+            }
+            if not enabled:
+                continue
+
+            key = (item.get("key") or "").strip()
+            value = (item.get("value") or "").strip()
+            if not key:
+                continue
+            if not key.startswith("-"):
+                key = f"--{key}"
+            cmd.append(key)
+            if value:
+                cmd.append(value)
+
+        if freeform_args.strip():
+            cmd.extend(shlex.split(freeform_args, posix=(os.name != "nt")))
+
+        return cmd
+
+    def _serialize(self, record: InstanceRecord) -> Dict:
+        return {
+            "instance_id": record.instance_id,
+            "name": record.name,
+            "executable_path": record.executable_path,
+            "pid": record.pid,
+            "status": record.status,
+            "created_at": record.created_at,
+            "command": record.command,
+            "log_file": str(record.log_file),
+            "visual_args": record.visual_args,
+            "freeform_args": record.freeform_args,
+        }
+
+
+class AutoScanService:
+    def __init__(self, manager: InstanceManager) -> None:
+        self.manager = manager
+        self._lock = threading.Lock()
+        self._versions: List[Dict[str, str]] = []
+        self._models: List[Dict[str, str]] = []
+        self._version_error = ""
+        self._model_error = ""
+        self._version_scanned_at = ""
+        self._model_scanned_at = ""
+        self._started = False
+
+    def _scan_versions(self, cfg: Dict) -> None:
+        roots = cfg.get("scan_roots", [])
+        max_depth = cfg.get("scan_max_depth", 5)
+        found: List[str] = []
+
+        if not roots:
+            with self._lock:
+                self._versions = []
+                self._version_error = "未配置 scan_roots"
+                self._version_scanned_at = utc_now_iso()
+            return
+
+        for root in roots:
+            try:
+                found.extend(self.manager.discover_llama_binaries(base_dir=root, max_depth=max_depth))
+            except Exception:
+                continue
+
+        with self._lock:
+            unique = sorted(set(found), key=lambda p: p.lower())
+            self._versions = []
+            for p in unique:
+                folder_name = Path(p).parent.name or Path(p).name
+                self._versions.append({"name": folder_name, "path": p})
+            self._version_error = "" if self._versions else "未扫描到 llama-server 可执行文件"
+            self._version_scanned_at = utc_now_iso()
+
+    def _scan_models(self, cfg: Dict) -> None:
+        roots = cfg.get("model_scan_roots", [])
+        max_depth = cfg.get("model_scan_max_depth", cfg.get("scan_max_depth", 5))
+        extensions = cfg.get("model_extensions", [".gguf", ".bin"])
+        found: List[str] = []
+
+        if not roots:
+            with self._lock:
+                self._models = []
+                self._model_error = "未配置 model_scan_roots"
+                self._model_scanned_at = utc_now_iso()
+            return
+
+        for root in roots:
+            try:
+                found.extend(
+                    self.manager.discover_model_files(
+                        base_dir=root,
+                        extensions=extensions,
+                        max_depth=max_depth,
+                    )
+                )
+            except Exception:
+                continue
+
+        with self._lock:
+            unique = sorted(set(found), key=lambda p: p.lower())
+            merged: Dict[tuple, Dict] = {}
+            shard_pattern = re.compile(r"^(.*?)(?:[-_])?(\d+)-of-(\d+)$", re.IGNORECASE)
+
+            for p in unique:
+                path_obj = Path(p)
+                stem = path_obj.stem
+                ext = path_obj.suffix.lower()
+                parent = str(path_obj.parent)
+
+                match = shard_pattern.match(stem)
+                if match:
+                    base_name = match.group(1).rstrip("-_")
+                    part_idx = int(match.group(2))
+                    total = int(match.group(3))
+
+                    if total > 1:
+                        key = (parent.lower(), base_name.lower(), ext)
+                        existing = merged.get(key)
+                        candidate = {
+                            "name": base_name,
+                            "path": p,
+                            "part_idx": part_idx,
+                        }
+                        if not existing or part_idx < existing["part_idx"]:
+                            merged[key] = candidate
+                        continue
+
+                key = (parent.lower(), stem.lower(), ext)
+                if key not in merged:
+                    merged[key] = {
+                        "name": stem,
+                        "path": p,
+                        "part_idx": 0,
+                    }
+
+            self._models = sorted(
+                [{"name": v["name"], "path": v["path"]} for v in merged.values()],
+                key=lambda item: item["name"].lower(),
+            )
+            self._model_error = "" if self._models else "未扫描到模型文件"
+            self._model_scanned_at = utc_now_iso()
+
+    def refresh_once(self) -> None:
+        cfg = load_runtime_config()
+        self._scan_versions(cfg)
+        self._scan_models(cfg)
+
+    def start(self) -> None:
+        with self._lock:
+            if self._started:
+                return
+            self._started = True
+
+        def loop() -> None:
+            while True:
+                try:
+                    self.refresh_once()
+                except Exception:
+                    pass
+
+                cfg = load_runtime_config()
+                interval = cfg.get("scan_interval_seconds", 30)
+                if not isinstance(interval, int) or interval <= 0:
+                    interval = 30
+                time.sleep(interval)
+
+        threading.Thread(target=loop, daemon=True).start()
+
+    def get_versions(self) -> Dict:
+        with self._lock:
+            return {
+                "items": list(self._versions),
+                "error": self._version_error,
+                "scanned_at": self._version_scanned_at,
+            }
+
+    def get_models(self) -> Dict:
+        with self._lock:
+            return {
+                "items": list(self._models),
+                "error": self._model_error,
+                "scanned_at": self._model_scanned_at,
+            }
+
+
+app = Flask(__name__)
+manager = InstanceManager()
+auto_scan_service = AutoScanService(manager)
+auto_scan_service.start()
+
+
+def _sse_event(event: str, payload: Dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+
+@app.get("/api/instances")
+def list_instances():
+    return jsonify({"items": manager.list_instances()})
+
+
+@app.post("/api/instances")
+def create_instance():
+    body = request.get_json(silent=True) or {}
+    try:
+        created = manager.create_instance(
+            name=body.get("name", ""),
+            server_dir=body.get("server_dir", body.get("executable_path", "")),
+            visual_args=body.get("visual_args", {}),
+            freeform_args=body.get("freeform_args", ""),
+        )
+        return jsonify(created), 201
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.delete("/api/instances/<instance_id>")
+def stop_instance(instance_id: str):
+    try:
+        data = manager.stop_instance(instance_id)
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 404
+
+
+@app.post("/api/instances/<instance_id>/start")
+def start_instance(instance_id: str):
+    try:
+        data = manager.start_instance(instance_id)
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.put("/api/instances/<instance_id>")
+def update_instance(instance_id: str):
+    body = request.get_json(silent=True) or {}
+    try:
+        updated = manager.update_instance(
+            instance_id=instance_id,
+            name=body.get("name", ""),
+            server_dir=body.get("server_dir", body.get("executable_path", "")),
+            visual_args=body.get("visual_args", {}),
+            freeform_args=body.get("freeform_args", ""),
+        )
+        return jsonify(updated)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.get("/api/instances/<instance_id>/logs")
+def get_logs(instance_id: str):
+    lines = request.args.get("lines", type=int, default=200)
+    record = manager.get_instance(instance_id)
+    if record:
+        return jsonify(
+            {
+                "instance_id": instance_id,
+                "status": record.status,
+                "lines": record.get_logs(lines),
+            }
+        )
+
+    matched = None
+    for item in manager._list_persisted_instances():
+        if item["instance_id"] == instance_id:
+            matched = item
+            break
+
+    if not matched:
+        return jsonify({"error": "实例不存在"}), 404
+
+    return jsonify(
+        {
+            "instance_id": instance_id,
+            "status": matched["status"],
+            "lines": manager._read_log_file_tail(matched["log_file"], lines),
+        }
+    )
+
+
+@app.get("/api/instances/<instance_id>/logs/stream")
+def stream_logs(instance_id: str):
+    lines = request.args.get("lines", type=int, default=300)
+    if lines <= 0:
+        lines = 300
+    lines = min(lines, 2000)
+
+    def generate():
+        sent_count = 0
+        snapshot_sent = False
+        last_ping_at = time.monotonic()
+
+        while True:
+            record = manager.get_instance(instance_id)
+
+            if record:
+                current_logs = record.get_logs(3000)
+                status = record.status
+
+                if not snapshot_sent:
+                    initial_lines = current_logs[-lines:]
+                    sent_count = len(current_logs)
+                    snapshot_sent = True
+                    yield _sse_event(
+                        "snapshot",
+                        {
+                            "instance_id": instance_id,
+                            "status": status,
+                            "lines": initial_lines,
+                        },
+                    )
+                else:
+                    if len(current_logs) < sent_count:
+                        # Ring buffer may have rotated; resync from current buffer.
+                        delta_lines = current_logs
+                    else:
+                        delta_lines = current_logs[sent_count:]
+                    sent_count = len(current_logs)
+
+                    if delta_lines:
+                        yield _sse_event(
+                            "append",
+                            {
+                                "instance_id": instance_id,
+                                "status": status,
+                                "lines": delta_lines,
+                            },
+                        )
+            else:
+                matched = manager._get_persisted_instance(instance_id)
+                if not matched:
+                    yield _sse_event("log-error", {"error": "实例不存在"})
+                    yield _sse_event("end", {"reason": "not-found"})
+                    break
+
+                if not snapshot_sent:
+                    tail_lines = manager._read_log_file_tail(matched["log_file"], lines)
+                    yield _sse_event(
+                        "snapshot",
+                        {
+                            "instance_id": instance_id,
+                            "status": matched["status"],
+                            "lines": tail_lines,
+                        },
+                    )
+
+                yield _sse_event(
+                    "status",
+                    {
+                        "instance_id": instance_id,
+                        "status": matched["status"],
+                    },
+                )
+                yield _sse_event("end", {"reason": "not-running"})
+                break
+
+            now = time.monotonic()
+            if now - last_ping_at >= 15:
+                last_ping_at = now
+                yield ": ping\n\n"
+
+            time.sleep(0.7)
+
+    headers = {
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    }
+    return Response(stream_with_context(generate()), mimetype="text/event-stream", headers=headers)
+
+
+@app.post("/api/command-preview")
+def command_preview():
+    body = request.get_json(silent=True) or {}
+    try:
+        preview = manager._build_command(
+            server_dir=body.get("server_dir", body.get("executable_path", "")),
+            visual_args=body.get("visual_args", {}),
+            freeform_args=body.get("freeform_args", ""),
+        )
+        return jsonify({"command": preview})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.get("/api/llama/discover")
+def discover_llama():
+    return jsonify(auto_scan_service.get_versions())
+
+
+@app.get("/api/models/discover")
+def discover_models():
+    return jsonify(auto_scan_service.get_models())
+
+
+if __name__ == "__main__":
+    host = os.environ.get("LLAMA_MANAGER_HOST", "0.0.0.0")
+    port = int(os.environ.get("LLAMA_MANAGER_PORT", "8787"))
+    app.run(host=host, port=port, debug=False)
