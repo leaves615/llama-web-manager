@@ -227,6 +227,9 @@ const InstanceForm = {
       name: "",
       serverDir: "",
       modelPath: "",
+      draftModelPath: "",
+      draftMax: "16",
+      draftMin: "4",
       host: "0.0.0.0",
       port: "8080",
       nCtx: "32768",
@@ -243,6 +246,9 @@ const InstanceForm = {
   computed: {
     isEdit() {
       return !!this.instance?.instance_id;
+    },
+    hasDraftModel() {
+      return !!this.draftModelPath?.trim();
     },
     nCtxOptionsFormatted() {
       return this.nCtxOptions.map(v => {
@@ -262,6 +268,9 @@ const InstanceForm = {
           this.name = val.name || "";
           this.serverDir = val.executable_path || "";
           this.modelPath = val.visual_args?.model_path || "";
+          this.draftModelPath = val.visual_args?.draft_model_path || "";
+          this.draftMax = String(val.visual_args?.draft_max || "16");
+          this.draftMin = String(val.visual_args?.draft_min || "4");
           this.host = val.visual_args?.host || "0.0.0.0";
           this.port = val.visual_args?.port || "8080";
           this.nCtx = String(val.visual_args?.n_ctx || "32768");
@@ -279,6 +288,9 @@ const InstanceForm = {
     name() { this.debouncedPreview(); },
     serverDir() { this.debouncedPreview(); },
     modelPath() { this.debouncedPreview(); },
+    draftModelPath() { this.debouncedPreview(); },
+    draftMax() { this.debouncedPreview(); },
+    draftMin() { this.debouncedPreview(); },
     host() { this.debouncedPreview(); },
     port() { this.debouncedPreview(); },
     nCtx() { this.debouncedPreview(); },
@@ -296,6 +308,9 @@ const InstanceForm = {
       this.name = "";
       this.serverDir = "";
       this.modelPath = "";
+      this.draftModelPath = "";
+      this.draftMax = "16";
+      this.draftMin = "4";
       this.host = "0.0.0.0";
       this.port = "8080";
       this.nCtx = "32768";
@@ -344,6 +359,9 @@ const InstanceForm = {
         server_dir: this.serverDir.trim(),
         visual_args: {
           model_path: this.modelPath.trim(),
+          draft_model_path: this.hasDraftModel ? this.draftModelPath.trim() : null,
+          draft_max: this.hasDraftModel ? (Number(this.draftMax) || null) : null,
+          draft_min: this.hasDraftModel ? (Number(this.draftMin) || null) : null,
           host: this.host.trim(),
           port: Number(this.port) || null,
           n_ctx: Number(this.nCtx) || null,
@@ -387,12 +405,12 @@ const InstanceForm = {
           </div>
         </div>
 
-        <div class="form-section">
+<div class="form-section">
           <div class="section-title">模型配置</div>
           <div class="form-grid">
             <div class="form-group">
               <label>Model 路径</label>
-              <input v-model="modelPath" placeholder="例如: D:\\models\\qwen.gguf" />
+              <input v-model="modelPath" placeholder="例如: D:\models\qwen.gguf" />
             </div>
             <div class="form-group">
               <label>或选择扫描模型</label>
@@ -400,6 +418,31 @@ const InstanceForm = {
                 <option value="">请选择</option>
                 <option v-for="m in modelOptions" :key="m.value" :value="m.value">{{ m.label }}</option>
               </select>
+            </div>
+            <div class="form-group">
+              <label>草稿模型路径</label>
+              <input v-model="draftModelPath" placeholder="可选的加速模型" />
+            </div>
+            <div class="form-group">
+              <label>或选择扫描模型</label>
+              <select v-model="draftModelPath">
+                <option value="">请选择</option>
+                <option v-for="m in modelOptions" :key="m.value" :value="m.value">{{ m.label }}</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <div class="form-section" v-if="hasDraftModel">
+          <div class="section-title">草稿模型参数</div>
+          <div class="form-grid two">
+            <div class="form-group">
+              <label>最大草稿数</label>
+              <input v-model="draftMax" type="number" placeholder="16" />
+            </div>
+            <div class="form-group">
+              <label>最小草稿数</label>
+              <input v-model="draftMin" type="number" placeholder="4" />
             </div>
           </div>
         </div>

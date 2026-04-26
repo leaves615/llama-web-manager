@@ -3,6 +3,8 @@ import json
 import os
 import re
 import shlex
+import signal
+import socket
 import sqlite3
 import subprocess
 import threading
@@ -13,6 +15,72 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import psutil
+
+
+APP_ROOT = Path(__file__).parent
+DAEMON_PID_FILE = APP_ROOT / "daemon.pid"
+
+
+def _get_daemon_info() -> Optional[tuple]:
+    """读取 daemon PID 和端口"""
+    if not DAEMON_PID_FILE.exists():
+        return None
+    try:
+        with open(DAEMON_PID_FILE, "r") as f:
+            lines = f.read().strip().split("\n")
+        if len(lines) < 2:
+            return None
+        return int(lines[0]), int(lines[1])
+    except:
+        return None
+
+
+def _is_daemon_running() -> bool:
+    """检查 daemon 是否运行"""
+    info = _get_daemon_info()
+    if not info:
+        return False
+    try:
+        proc = psutil.Process(info[0])
+        return proc.is_running()
+    except psutil.NoSuchProcess:
+        return False
+
+
+def _control_request(request: Dict, timeout: float = 10) -> Optional[Dict]:
+    """向 daemon 发送 TCP 控制请求"""
+    info = _get_daemon_info()
+    if not info:
+        return None
+
+    daemon_pid, port = info
+
+    try:
+        proc = psutil.Process(daemon_pid)
+        if not proc.is_running():
+            return None
+    except psutil.NoSuchProcess:
+        return None
+
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        sock.connect(("127.0.0.1", port))
+        sock.sendall((json.dumps(request) + "\n").encode("utf-8"))
+        response = sock.recv(8192)
+        sock.close()
+        return json.loads(response.decode("utf-8"))
+    except Exception as e:
+        print(f"TCP request failed: {e}")
+        return None
+
+
+def stop_daemon_via_tcp() -> bool:
+    """通过 TCP 连接停止 daemon"""
+    response = _control_request({"action": "stop", "target": "daemon"}, timeout=10)
+    if response and response.get("success"):
+        return True
+    return False
 from flask import Flask, Response, jsonify, render_template, request, stream_with_context
 import yaml
 
@@ -688,15 +756,20 @@ class InstanceManager:
         cmd: List[str] = [executable]
 
         model = (visual_args.get("model_path") or "").strip()
+        draft_model = (visual_args.get("draft_model_path") or "").strip()
         host = (visual_args.get("host") or "").strip()
         port = visual_args.get("port")
         n_ctx = visual_args.get("n_ctx")
         n_threads = visual_args.get("n_threads")
         gpu_layers = visual_args.get("gpu_layers")
+        draft_max = visual_args.get("draft_max")
+        draft_min = visual_args.get("draft_min")
         extra_kv = visual_args.get("extra_flags") or []
 
         if model:
             cmd.extend(["--model", model])
+        if draft_model:
+            cmd.extend(["--model-draft", draft_model])
         if host:
             cmd.extend(["--host", host])
         if port:
@@ -707,6 +780,10 @@ class InstanceManager:
             cmd.extend(["--threads", str(n_threads)])
         if gpu_layers is not None and str(gpu_layers).strip() != "":
             cmd.extend(["--n-gpu-layers", str(gpu_layers)])
+        if draft_max is not None:
+            cmd.extend(["--draft-max", str(draft_max)])
+        if draft_min is not None:
+            cmd.extend(["--draft-min", str(draft_min)])
 
         for item in extra_kv:
             enabled_raw = item.get("enabled", True)
@@ -1045,28 +1122,16 @@ def daemon_start():
 
 @app.post("/api/daemon/stop")
 def daemon_stop():
-    import psutil
-
-    current_pid = os.getpid()
-    for proc in psutil.process_iter(["pid", "name", "cmdline"]):
-        try:
-            if proc.info["pid"] == current_pid:
-                continue
-            cmdline = proc.info.get("cmdline") or []
-            if any("daemon.py" in str(arg) for arg in cmdline):
-                proc.terminate()
-                try:
-                    proc.wait(timeout=5)
-                except psutil.TimeoutExpired:
-                    proc.kill()
-                return jsonify({"success": True})
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
+    if stop_daemon_via_tcp():
+        return jsonify({"success": True})
     return jsonify({"error": "守护进程未运行"}), 400
 
 
 @app.get("/api/instances")
 def list_instances():
+    response = _control_request({"action": "list", "target": "instance"})
+    if response and response.get("success"):
+        return jsonify({"items": response.get("instances", [])})
     return jsonify({"items": manager.list_instances()})
 
 
@@ -1087,20 +1152,18 @@ def create_instance():
 
 @app.post("/api/instances/<instance_id>/stop")
 def stop_instance(instance_id: str):
-    try:
-        data = manager.stop_instance(instance_id)
-        return jsonify(data)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 404
+    response = _control_request({"action": "stop", "target": "instance", "instance_id": instance_id})
+    if response and response.get("success"):
+        return jsonify(response.get("instance", {}))
+    return jsonify({"error": response.get("error", "failed") if response else "daemon not running"}), 400
 
 
 @app.post("/api/instances/<instance_id>/start")
 def start_instance(instance_id: str):
-    try:
-        data = manager.start_instance(instance_id)
-        return jsonify(data)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
+    response = _control_request({"action": "start", "target": "instance", "instance_id": instance_id})
+    if response and response.get("success"):
+        return jsonify(response.get("instance", {}))
+    return jsonify({"error": response.get("error", "failed") if response else "daemon not running"}), 400
 
 
 @app.put("/api/instances/<instance_id>")
@@ -1292,14 +1355,19 @@ def _build_partial_command(server_dir: str, visual_args: Dict, freeform_args: st
             return []
         cmd = [exe]
         model = (visual_args.get("model_path") or "").strip()
+        draft_model = (visual_args.get("draft_model_path") or "").strip()
         host = (visual_args.get("host") or "").strip()
         port = visual_args.get("port")
         n_ctx = visual_args.get("n_ctx")
         n_threads = visual_args.get("n_threads")
         gpu_layers = visual_args.get("gpu_layers")
+        draft_max = visual_args.get("draft_max")
+        draft_min = visual_args.get("draft_min")
         extra_kv = visual_args.get("extra_flags") or []
         if model:
             cmd.extend(["--model", model])
+        if draft_model:
+            cmd.extend(["--model-draft", draft_model])
         if host:
             cmd.extend(["--host", host])
         if port:
@@ -1310,6 +1378,10 @@ def _build_partial_command(server_dir: str, visual_args: Dict, freeform_args: st
             cmd.extend(["--threads", str(n_threads)])
         if gpu_layers is not None and str(gpu_layers).strip() != "":
             cmd.extend(["--n-gpu-layers", str(gpu_layers)])
+        if draft_max is not None:
+            cmd.extend(["--draft-max", str(draft_max)])
+        if draft_min is not None:
+            cmd.extend(["--draft-min", str(draft_min)])
         for item in extra_kv:
             enabled_raw = item.get("enabled", True)
             enabled = enabled_raw if isinstance(enabled_raw, bool) else str(enabled_raw).strip().lower() not in {"0", "false", "off", "no"}
