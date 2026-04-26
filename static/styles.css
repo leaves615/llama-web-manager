@@ -182,7 +182,7 @@ h1, h2 {
 .scroll-latest-btn {
   position: absolute;
   bottom: 16px;
-  right: 16px;
+  right: 24px;
   width: 32px;
   height: 32px;
   display: flex;
