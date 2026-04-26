@@ -3,3 +3,4 @@ __pycache__/
 *.db
 self_docs/
 AGENTS.md
+*.pid
