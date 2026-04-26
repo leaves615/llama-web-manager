@@ -114,7 +114,6 @@ const InstanceList = {
         v-for="item in instances"
         :key="item.instance_id"
         :class="['instance-card', { selected: item.instance_id === selectedId }]"
-        @click="$emit('select', item.instance_id, item.name)"
       >
         <strong>{{ item.name }}</strong>
         <div class="meta">ID: {{ item.instance_id }} | PID: {{ item.pid }} | {{ item.status }}</div>
