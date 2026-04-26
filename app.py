@@ -170,6 +170,7 @@ class InstanceRecord:
         log_file: Path,
         visual_args: Dict,
         freeform_args: str,
+        env_vars: List[Dict],
         created_at: str | None = None,
         is_attached: bool = False,
     ) -> None:
@@ -181,6 +182,7 @@ class InstanceRecord:
         self.log_file = log_file
         self.visual_args = visual_args
         self.freeform_args = freeform_args
+        self.env_vars = env_vars
         self.created_at = created_at or utc_now_iso()
         self.stopped_by_manager = False
         self.logs = deque(maxlen=3000)
@@ -256,18 +258,18 @@ class InstanceManager:
                         command_json TEXT NOT NULL,
                         visual_args_json TEXT NOT NULL,
                         freeform_args TEXT NOT NULL,
+                        env_vars_json TEXT NOT NULL,
                         log_file TEXT NOT NULL,
                         pid INTEGER,
                         status TEXT NOT NULL,
                         command TEXT,
                         created_at TEXT NOT NULL,
-                        updated_at TEXT NOT NULL,
-                        command TEXT
+                        updated_at TEXT NOT NULL
                     )
                     """
                 )
                 try:
-                    conn.execute("ALTER TABLE instances ADD COLUMN command TEXT")
+                    conn.execute("ALTER TABLE instances ADD COLUMN env_vars_json TEXT DEFAULT '[]'")
                 except sqlite3.OperationalError:
                     pass
 
@@ -280,6 +282,7 @@ class InstanceManager:
         command: List[str],
         visual_args: Dict,
         freeform_args: str,
+        env_vars: List[Dict],
         log_file: Path,
         pid: int | None,
         status: str,
@@ -292,14 +295,15 @@ class InstanceManager:
                     """
                     INSERT INTO instances (
                         instance_id, name, executable_path, command_json, visual_args_json,
-                        freeform_args, log_file, pid, status, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        freeform_args, env_vars_json, log_file, pid, status, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(instance_id) DO UPDATE SET
                         name=excluded.name,
                         executable_path=excluded.executable_path,
                         command_json=excluded.command_json,
                         visual_args_json=excluded.visual_args_json,
                         freeform_args=excluded.freeform_args,
+                        env_vars_json=excluded.env_vars_json,
                         log_file=excluded.log_file,
                         pid=excluded.pid,
                         status=excluded.status,
@@ -312,6 +316,7 @@ class InstanceManager:
                         json.dumps(command, ensure_ascii=False),
                         json.dumps(visual_args, ensure_ascii=False),
                         freeform_args,
+                        json.dumps(env_vars, ensure_ascii=False),
                         str(log_file),
                         pid,
                         status,
@@ -349,6 +354,7 @@ class InstanceManager:
                     "log_file": row["log_file"],
                     "visual_args": json.loads(row["visual_args_json"]),
                     "freeform_args": row["freeform_args"],
+                    "env_vars": json.loads(row["env_vars_json"] or "[]"),
                 }
             )
         return items
@@ -375,50 +381,46 @@ class InstanceManager:
             "log_file": row["log_file"],
             "visual_args": json.loads(row["visual_args_json"]),
             "freeform_args": row["freeform_args"],
+            "env_vars": json.loads(row["env_vars_json"] or "[]"),
         }
 
     def read_log_file(self, instance_id: str, lines: int = 200) -> List[str]:
         persisted = self._get_persisted_instance(instance_id)
         if not persisted:
             return []
-        
+
         log_file = Path(persisted["log_file"])
         if not log_file.exists():
             return []
-        
+
         try:
             with open(log_file, "r", encoding="utf-8", errors="replace") as f:
                 all_lines = f.readlines()
                 return [line.rstrip("\n\r") for line in all_lines[-lines:] if line.strip()]
         except Exception:
             return []
-        with self._db_lock:
-            with self._db_conn() as conn:
-                row = conn.execute(
-                    "SELECT * FROM instances WHERE instance_id = ?",
-                    (instance_id,),
-                ).fetchone()
 
-        if not row:
-            return None
-
-        return {
-            "instance_id": row["instance_id"],
-            "name": row["name"],
-            "executable_path": row["executable_path"],
-            "pid": row["pid"],
-            "status": row["status"],
-            "created_at": row["created_at"],
-            "command": json.loads(row["command_json"]),
-            "log_file": row["log_file"],
-            "visual_args": json.loads(row["visual_args_json"]),
-            "freeform_args": row["freeform_args"],
-        }
-
-    def _start_process(self, command: List[str]) -> subprocess.Popen:
+    def _start_process(self, command: List[str], env_vars: List[Dict] | None = None) -> subprocess.Popen:
         creationflags = 0
         if os.name == "nt":
             creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+
+        env = os.environ.copy()
+        if env_vars:
+            for item in env_vars:
+                enabled_raw = item.get("enabled", True)
+                enabled = enabled_raw if isinstance(enabled_raw, bool) else str(enabled_raw).strip().lower() not in {
+                    "0",
+                    "false",
+                    "off",
+                    "no",
+                }
+                if not enabled:
+                    continue
+                key = (item.get("key") or "").strip()
+                value = (item.get("value") or "").strip()
+                if key:
+                    env[key] = value
 
         return subprocess.Popen(
             command,
@@ -429,6 +431,7 @@ class InstanceManager:
             errors="replace",
             bufsize=1,
             creationflags=creationflags,
+            env=env,
         )
 
     def _terminate_process(self, record: InstanceRecord) -> None:
@@ -582,6 +585,7 @@ class InstanceManager:
         server_dir: str,
         visual_args: Dict,
         freeform_args: str,
+        env_vars: List[Dict],
     ) -> Dict:
         if not server_dir:
             raise ValueError("server_dir 不能为空")
@@ -598,6 +602,7 @@ class InstanceManager:
             command=command,
             visual_args=visual_args,
             freeform_args=freeform_args,
+            env_vars=env_vars,
             log_file=log_file,
             pid=None,
             status="stopped",
@@ -615,6 +620,7 @@ class InstanceManager:
             "log_file": str(log_file),
             "visual_args": visual_args,
             "freeform_args": freeform_args,
+            "env_vars": env_vars,
         }
 
     def start_instance(self, instance_id: str) -> Dict:
@@ -644,6 +650,7 @@ class InstanceManager:
             "log_file": persisted["log_file"],
             "visual_args": persisted["visual_args"],
             "freeform_args": persisted["freeform_args"],
+            "env_vars": persisted.get("env_vars", []),
         }
 
     def update_instance(
@@ -653,6 +660,7 @@ class InstanceManager:
         server_dir: str,
         visual_args: Dict,
         freeform_args: str,
+        env_vars: List[Dict],
     ) -> Dict:
         if not server_dir:
             raise ValueError("server_dir 不能为空")
@@ -665,8 +673,8 @@ class InstanceManager:
         log_file = persisted["log_file"]
 
         self._db_execute(
-            "UPDATE instances SET name = ?, executable_path = ?, command_json = ?, visual_args_json = ?, freeform_args = ?, command = 'start', updated_at = ? WHERE instance_id = ?",
-            (name, server_dir, json.dumps(command, ensure_ascii=False), json.dumps(visual_args, ensure_ascii=False), freeform_args, utc_now_iso(), instance_id),
+            "UPDATE instances SET name = ?, executable_path = ?, command_json = ?, visual_args_json = ?, freeform_args = ?, env_vars_json = ?, command = 'start', updated_at = ? WHERE instance_id = ?",
+            (name, server_dir, json.dumps(command, ensure_ascii=False), json.dumps(visual_args, ensure_ascii=False), freeform_args, json.dumps(env_vars, ensure_ascii=False), utc_now_iso(), instance_id),
         )
 
         return {
@@ -680,6 +688,7 @@ class InstanceManager:
             "log_file": log_file,
             "visual_args": visual_args,
             "freeform_args": freeform_args,
+            "env_vars": env_vars,
         }
 
     def stop_instance(self, instance_id: str) -> Dict:
@@ -823,6 +832,7 @@ class InstanceManager:
             "log_file": str(record.log_file),
             "visual_args": record.visual_args,
             "freeform_args": record.freeform_args,
+            "env_vars": record.env_vars,
         }
 
 
@@ -1144,6 +1154,7 @@ def create_instance():
             server_dir=body.get("server_dir", body.get("executable_path", "")),
             visual_args=body.get("visual_args", {}),
             freeform_args=body.get("freeform_args", ""),
+            env_vars=body.get("env_vars", []),
         )
         return jsonify(created), 201
     except Exception as e:
@@ -1176,6 +1187,7 @@ def update_instance(instance_id: str):
             server_dir=body.get("server_dir", body.get("executable_path", "")),
             visual_args=body.get("visual_args", {}),
             freeform_args=body.get("freeform_args", ""),
+            env_vars=body.get("env_vars", []),
         )
         return jsonify(updated)
     except Exception as e:

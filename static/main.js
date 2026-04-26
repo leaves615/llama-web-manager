@@ -93,7 +93,7 @@ const DaemonPanel = {
 
 const InstanceList = {
   props: ["instances", "selectedId", "loadingIds"],
-  emits: ["select", "edit", "toggle"],
+  emits: ["select", "edit", "toggle", "copy"],
   computed: {
     firstRunning() {
       return this.instances.find(i => String(i.status).startsWith("running"));
@@ -120,6 +120,7 @@ const InstanceList = {
         <div class="cmd">{{ (item.command || []).join(" ") }}</div>
         <div class="instance-actions">
           <button class="view-log" @click.stop="$emit('select', item.instance_id, item.name)">查看日志</button>
+          <button class="copy" @click.stop="$emit('copy', item)">复制配置</button>
           <button class="edit" @click.stop="$emit('edit', item)">编辑</button>
           <button
             :class="['toggle', 'loading-effect', isRunning(item.status) ? 'danger' : 'primary', { loading: isLoading(item.instance_id) }]"
@@ -147,6 +148,9 @@ const LogViewer = {
   computed: {
     isLoading() {
       return this.loading || this.loadingMore;
+    },
+    showScrollLatest() {
+      return !this.autoScroll;
     }
   },
   watch: {
@@ -183,6 +187,7 @@ const LogViewer = {
       if (el) {
         el.scrollTop = el.scrollHeight;
       }
+      this.autoScroll = true;
     },
     keepScrollPosition() {
       const el = this.$refs.output;
@@ -210,38 +215,51 @@ const LogViewer = {
     }
   },
   template: `
-    <pre
-      ref="output"
-      :class="['log-output', cssClass, { loading: loading }]"
-      @scroll="onScroll(); onScrollTop()"
-    ></pre>
+    <div class="log-wrapper">
+      <pre
+        ref="output"
+        :class="['log-output', cssClass, { loading: loading }]"
+        @scroll="onScroll(); onScrollTop()"
+      ></pre>
+      <button
+        v-if="showScrollLatest"
+        class="scroll-latest-btn"
+        @click="scrollToBottom"
+        title="滚动到最新"
+      >
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+          <path d="M8 3v10M4 9l4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </button>
+    </div>
   `
 };
 
 const InstanceForm = {
   props: ["instance", "loading"],
   emits: ["save", "close"],
-  data() {
-    return {
-      name: "",
-      serverDir: "",
-      modelPath: "",
-      draftModelPath: "",
-      draftMax: "16",
-      draftMin: "4",
-      host: "0.0.0.0",
-      port: "8080",
-      nCtx: "32768",
-      nThreads: "8",
-      gpuLayers: "0",
-      freeform: "",
-      extraFlags: [{ key: "--temp", value: "0.7", enabled: true }, { key: "--top-p", value: "0.9", enabled: true }],
-      previewText: "尚未生成",
-      versionOptions: [],
-      modelOptions: [],
-      nCtxOptions: ["2048", "4096", "8192", "16384", "32768", "65536", "131072", "262144", "524288", "1048576"]
-    };
-  },
+data() {
+      return {
+        name: "",
+        serverDir: "",
+        modelPath: "",
+        draftModelPath: "",
+        draftMax: "16",
+        draftMin: "4",
+        host: "0.0.0.0",
+        port: "8080",
+        nCtx: "32768",
+        nThreads: "8",
+        gpuLayers: "0",
+        freeform: "",
+        extraFlags: [{ key: "--temp", value: "0.7", enabled: true }, { key: "--top-p", value: "0.9", enabled: true }],
+        envVars: [{ key: "", value: "", enabled: true }],
+        previewText: "尚未生成",
+        versionOptions: [],
+        modelOptions: [],
+        nCtxOptions: ["2048", "4096", "8192", "16384", "32768", "65536", "131072", "262144", "524288", "1048576"]
+      };
+    },
   computed: {
     isEdit() {
       return !!this.instance?.instance_id;
@@ -279,6 +297,9 @@ const InstanceForm = {
           this.extraFlags = (val.visual_args?.extra_flags || []).length 
             ? val.visual_args.extra_flags 
             : [{ key: "--temp", value: "0.7", enabled: true }, { key: "--top-p", value: "0.9", enabled: true }];
+          this.envVars = (val.env_vars || []).length 
+            ? val.env_vars 
+            : [{ key: "", value: "", enabled: true }];
         } else {
           this.reset();
         }
@@ -286,7 +307,19 @@ const InstanceForm = {
     },
     name() { this.debouncedPreview(); },
     serverDir() { this.debouncedPreview(); },
-    modelPath() { this.debouncedPreview(); },
+    modelPath() {
+      this.debouncedPreview();
+      if (this.modelPath) {
+        const match = this.modelOptions.find(m => m.value === this.modelPath);
+        if (match) {
+          const suggested = match.label;
+          if (!this.name || this.name === this._lastSuggestedName) {
+            this.name = suggested;
+            this._lastSuggestedName = suggested;
+          }
+        }
+      }
+    },
     draftModelPath() { this.debouncedPreview(); },
     draftMax() { this.debouncedPreview(); },
     draftMin() { this.debouncedPreview(); },
@@ -296,7 +329,8 @@ const InstanceForm = {
     nThreads() { this.debouncedPreview(); },
     gpuLayers() { this.debouncedPreview(); },
     freeform() { this.debouncedPreview(); },
-    extraFlags: { deep: true, handler() { this.debouncedPreview(); } }
+    extraFlags: { deep: true, handler() { this.debouncedPreview(); } },
+    envVars: { deep: true, handler() { this.debouncedPreview(); } }
   },
   mounted() {
     this.loadOptions();
@@ -305,6 +339,7 @@ const InstanceForm = {
   methods: {
     reset() {
       this.name = "";
+      this._lastSuggestedName = "";
       this.serverDir = "";
       this.modelPath = "";
       this.draftModelPath = "";
@@ -317,6 +352,7 @@ const InstanceForm = {
       this.gpuLayers = "0";
       this.freeform = "";
       this.extraFlags = [{ key: "--temp", value: "0.7", enabled: true }, { key: "--top-p", value: "0.9", enabled: true }];
+      this.envVars = [{ key: "", value: "", enabled: true }];
     },
     async loadOptions() {
       try {
@@ -338,6 +374,12 @@ const InstanceForm = {
     },
     removeFlag(index) {
       this.extraFlags.splice(index, 1);
+    },
+    addEnvVar() {
+      this.envVars.push({ key: "", value: "", enabled: true });
+    },
+    removeEnvVar(index) {
+      this.envVars.splice(index, 1);
     },
     async preview() {
       const payload = this.collectPayload();
@@ -368,7 +410,8 @@ const InstanceForm = {
           gpu_layers: this.gpuLayers === "" ? null : Number(this.gpuLayers),
           extra_flags: this.extraFlags.filter(f => f.enabled && f.key)
         },
-        freeform_args: this.freeform
+        freeform_args: this.freeform,
+        env_vars: this.envVars.filter(e => e.enabled && e.key)
       };
     },
     async save() {
@@ -476,11 +519,40 @@ const InstanceForm = {
           </div>
         </div>
 
-        <div class="form-section">
+<div class="form-section">
           <div class="section-title">
             额外参数
             <button type="button" class="small" @click="addFlag">+ 添加</button>
           </div>
+          <div v-for="(flag, idx) in extraFlags" :key="idx" class="flag-row">
+            <input v-model="flag.key" placeholder="--temp" />
+            <input v-model="flag.value" placeholder="0.8" />
+            <label class="flag-enable">
+              <input type="checkbox" v-model="flag.enabled" />启用
+            </label>
+            <button type="button" class="danger small" @click="removeFlag(idx)">删除</button>
+          </div>
+        </div>
+
+        <div class="form-section">
+          <div class="section-title">
+            环境变量
+            <button type="button" class="small" @click="addEnvVar">+ 添加</button>
+          </div>
+          <div v-for="(env, idx) in envVars" :key="idx" class="flag-row">
+            <input v-model="env.key" placeholder="KEY" />
+            <input v-model="env.value" placeholder="value" />
+            <label class="flag-enable">
+              <input type="checkbox" v-model="env.enabled" />启用
+            </label>
+            <button type="button" class="danger small" @click="removeEnvVar(idx)">删除</button>
+          </div>
+        </div>
+
+<div class="form-section">
+          <div class="section-title">自由文本参数</div>
+          <textarea v-model="freeform" rows="2" placeholder="例如：--temp 0.7 --top-p 0.9"></textarea>
+        </div>
           <div v-for="(flag, idx) in extraFlags" :key="idx" class="flag-row">
             <input v-model="flag.key" placeholder="--temp" />
             <input v-model="flag.value" placeholder="0.8" />
@@ -583,7 +655,7 @@ const app = createApp({
         this.daemonStatus = JSON.parse(e.data || "{}");
       });
       this.daemonStream.addEventListener("instances", (e) => {
-        this.instances = JSON.parse(e.data || "{}").items || [];
+        this.instances = this.sortInstances(JSON.parse(e.data || "{}").items || []);
       });
       this.daemonStream.onerror = () => {
         setTimeout(() => this.initSSE(), 5000);
@@ -592,10 +664,17 @@ const app = createApp({
     async refreshInstances() {
       try {
         const data = await api.getInstances();
-        this.instances = data.items || [];
+        this.instances = this.sortInstances(data.items || []);
       } catch (e) {
         console.error(e);
       }
+    },
+    sortInstances(items) {
+      return [...items].sort((a, b) => {
+        const timeA = a.created_at || "";
+        const timeB = b.created_at || "";
+        return timeB.localeCompare(timeA);
+      });
     },
     async toggleDaemon() {
       this.daemonLoading = true;
@@ -657,6 +736,11 @@ const app = createApp({
     },
     openForm(instance) {
       this.editingInstance = instance;
+      this.showForm = true;
+    },
+    copyInstance(instance) {
+      const { instance_id, pid, status, name, ...rest } = instance;
+      this.editingInstance = { ...rest, name: name + " (副本)" };
       this.showForm = true;
     },
     async saveForm(payload) {

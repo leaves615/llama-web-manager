@@ -140,6 +140,14 @@ h1, h2 {
   font-size: 12px;
 }
 
+.log-wrapper {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
+
 .log-output {
   flex: 1;
   min-height: 0;
@@ -169,6 +177,29 @@ h1, h2 {
   line-height: 1.5;
   white-space: pre-wrap;
   word-break: break-all;
+}
+
+.scroll-latest-btn {
+  position: absolute;
+  bottom: 16px;
+  right: 16px;
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(14, 124, 134, 0.85);
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  color: #fff;
+  padding: 0;
+  z-index: 10;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+}
+
+.scroll-latest-btn:hover {
+  background: var(--accent);
+  border-color: #0a6b74;
 }
 
 .log-modal {

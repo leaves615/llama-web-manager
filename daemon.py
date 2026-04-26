@@ -151,6 +151,7 @@ class LlamaInstance:
         log_file: Path,
         visual_args: Dict,
         freeform_args: str,
+        env_vars: List[Dict],
         created_at: str,
     ):
         self.instance_id = instance_id
@@ -160,6 +161,7 @@ class LlamaInstance:
         self.log_file = log_file
         self.visual_args = visual_args
         self.freeform_args = freeform_args
+        self.env_vars = env_vars
         self.created_at = created_at
         self.process: Optional[subprocess.Popen] = None
         self._stopped_by_manager = False
@@ -182,6 +184,13 @@ class LlamaInstance:
         if os.name == "nt":
             creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
 
+        env = os.environ.copy()
+        for item in self.env_vars:
+            key = (item.get("key") or "").strip()
+            value = (item.get("value") or "").strip()
+            if key:
+                env[key] = value
+
         self.process = subprocess.Popen(
             self.command,
             stdout=subprocess.PIPE,
@@ -191,6 +200,7 @@ class LlamaInstance:
             errors="replace",
             bufsize=1,
             creationflags=creationflags,
+            env=env,
         )
 
         self._start_log_capture()
@@ -539,6 +549,7 @@ class DaemonManager:
                     log_file=log_file,
                     visual_args=json.loads(row["visual_args_json"]),
                     freeform_args=row["freeform_args"],
+                    env_vars=json.loads(row.get("env_vars_json") or "[]"),
                     created_at=row["created_at"],
                 )
                 instance._stopped_by_manager = True
@@ -586,6 +597,7 @@ class DaemonManager:
                 log_file=log_file,
                 visual_args=json.loads(row["visual_args_json"]),
                 freeform_args=row["freeform_args"],
+                env_vars=json.loads(row.get("env_vars_json") or "[]"),
                 created_at=row["created_at"],
             )
             instance.start()
