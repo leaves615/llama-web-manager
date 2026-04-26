@@ -56,13 +56,14 @@
         </section>
       </main>
 
-      <instance-form
-        v-if="showForm"
-        :instance="editingInstance"
-        :loading="formLoading"
-        @save="saveForm"
-        @close="showForm = false"
-      ></instance-form>
+      <div v-if="showForm" class="form-modal">
+        <instance-form
+          :instance="editingInstance"
+          :loading="formLoading"
+          @save="saveForm"
+          @close="showForm = false"
+        ></instance-form>
+      </div>
 
       <log-modal
         v-if="showLogLarge"

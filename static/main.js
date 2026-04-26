@@ -201,12 +201,9 @@ const LogViewer = {
     onScrollTop() {
       const el = this.$refs.output;
       if (!el) return;
-      console.log("scrollTop:", el.scrollTop, "loadingMore:", this.loadingMore, "loading:", this.loading);
       if (el.scrollTop <= 10 && !this.loadingMore && !this.loading) {
         this.loadingMore = true;
-        console.log("emitting loadMore");
         this.$emit("loadMore");
-        // 直接调用全局方法
         if (window.loadMoreLogs) {
           window.loadMoreLogs();
         }
@@ -246,6 +243,15 @@ const InstanceForm = {
   computed: {
     isEdit() {
       return !!this.instance?.instance_id;
+    },
+    nCtxOptionsFormatted() {
+      return this.nCtxOptions.map(v => {
+        const n = parseInt(v);
+        return {
+          value: v,
+          label: n >= 1048576 ? (n / 1048576) + 'M' : n >= 1024 ? (n / 1024) + 'k' : v
+        };
+      });
     }
   },
   watch: {
@@ -269,10 +275,21 @@ const InstanceForm = {
           this.reset();
         }
       }
-    }
+    },
+    name() { this.debouncedPreview(); },
+    serverDir() { this.debouncedPreview(); },
+    modelPath() { this.debouncedPreview(); },
+    host() { this.debouncedPreview(); },
+    port() { this.debouncedPreview(); },
+    nCtx() { this.debouncedPreview(); },
+    nThreads() { this.debouncedPreview(); },
+    gpuLayers() { this.debouncedPreview(); },
+    freeform() { this.debouncedPreview(); },
+    extraFlags: { deep: true, handler() { this.debouncedPreview(); } }
   },
   mounted() {
     this.loadOptions();
+    this.$nextTick(() => this.preview());
   },
   methods: {
     reset() {
@@ -314,8 +331,12 @@ const InstanceForm = {
         const data = await api.previewCommand(payload);
         this.previewText = data.command.join(" ");
       } catch (e) {
-        this.previewText = "错误：" + e.message;
+        console.warn("Preview error:", e.message);
       }
+    },
+    debouncedPreview() {
+      clearTimeout(this._previewTimer);
+      this._previewTimer = setTimeout(() => this.preview(), 300);
     },
     collectPayload() {
       return {
@@ -359,7 +380,7 @@ const InstanceForm = {
             <div class="form-group full-width">
               <label>或选择扫描版本</label>
               <select v-model="serverDir">
-                <option value="">扫描中...</option>
+                <option value="">请选择</option>
                 <option v-for="v in versionOptions" :key="v.value" :value="v.value">{{ v.label }}</option>
               </select>
             </div>
@@ -376,7 +397,7 @@ const InstanceForm = {
             <div class="form-group">
               <label>或选择扫描模型</label>
               <select v-model="modelPath">
-                <option value="">扫描中...</option>
+                <option value="">请选择</option>
                 <option v-for="m in modelOptions" :key="m.value" :value="m.value">{{ m.label }}</option>
               </select>
             </div>
@@ -407,7 +428,7 @@ const InstanceForm = {
             <div class="form-group">
               <label>Context Size</label>
               <select v-model="nCtx">
-                <option v-for="c in nCtxOptions" :key="c" :value="c">{{ c }}</option>
+                <option v-for="c in nCtxOptionsFormatted" :key="c.value" :value="c.value">{{ c.label }}</option>
               </select>
             </div>
           </div>
@@ -502,19 +523,18 @@ const app = createApp({
   },
   mounted() {
     this.initSSE();
-    this.refreshInstances();
-    // 暴露方法到 window
+    this.refreshInstances().then(() => {
+      const running = this.instances.find(i => String(i.status).startsWith("running"));
+      if (running) {
+        this.selectInstance(running.instance_id, running.name);
+      }
+    });
     window.appVm = this;
   },
   beforeUnmount() {
     this.closeStreams();
   },
   methods: {
-    testClick() {
-      console.log("按钮被点击了");
-      this.showLogLarge = true;
-      console.log("showLogLarge:", this.showLogLarge);
-    },
     initSSE() {
       this.daemonStream = new EventSource("/api/daemon/status/stream");
       this.daemonStream.addEventListener("status", (e) => {
@@ -579,18 +599,13 @@ const app = createApp({
       };
     },
     async loadMoreLogs() {
-      console.log("loadMoreLogs called", this.selectedInstanceId, this.logOffset);
       if (this.logLoadMoreLoading || !this.selectedInstanceId) return;
       this.logLoadMoreLoading = true;
       try {
-        console.log("Fetching logs before offset:", this.logOffset);
         const data = await api.getLogsBefore(this.selectedInstanceId, this.logOffset, 200);
-        console.log("Got logs:", data);
         if (data.lines && data.lines.length > 0) {
           this.currentLogs = [...data.lines, ...this.currentLogs];
           this.logOffset = this.currentLogs.length;
-        } else {
-          console.log("No more logs to load");
         }
       } catch (e) {
         console.error(e);
@@ -651,10 +666,7 @@ const app = createApp({
 app.mount("#app");
 
 window.loadMoreLogs = function() {
-  console.log("window.loadMoreLogs called", window.appVm);
   if (window.appVm) {
     window.appVm.loadMoreLogs();
-  } else {
-    console.log("appVm not found");
   }
 };

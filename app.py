@@ -1267,7 +1267,71 @@ def command_preview():
         )
         return jsonify({"command": preview})
     except Exception as e:
+        server_dir = body.get("server_dir", body.get("executable_path", ""))
+        if server_dir:
+            preview = _build_partial_command(server_dir, body.get("visual_args", {}), body.get("freeform_args", ""))
+            if preview:
+                return jsonify({"command": preview})
         return jsonify({"error": str(e)}), 400
+
+
+def _build_partial_command(server_dir: str, visual_args: Dict, freeform_args: str) -> List[str]:
+    try:
+        from pathlib import Path
+        raw = (server_dir or "").strip()
+        if not raw:
+            return []
+        path = Path(raw)
+        exe = str(path) if path.is_file() else None
+        if not exe:
+            exe_name = "llama-server.exe" if os.name == "nt" else "llama-server"
+            candidate = path / exe_name
+            if candidate.exists():
+                exe = str(candidate)
+        if not exe:
+            return []
+        cmd = [exe]
+        model = (visual_args.get("model_path") or "").strip()
+        host = (visual_args.get("host") or "").strip()
+        port = visual_args.get("port")
+        n_ctx = visual_args.get("n_ctx")
+        n_threads = visual_args.get("n_threads")
+        gpu_layers = visual_args.get("gpu_layers")
+        extra_kv = visual_args.get("extra_flags") or []
+        if model:
+            cmd.extend(["--model", model])
+        if host:
+            cmd.extend(["--host", host])
+        if port:
+            cmd.extend(["--port", str(port)])
+        if n_ctx:
+            cmd.extend(["--ctx-size", str(n_ctx)])
+        if n_threads:
+            cmd.extend(["--threads", str(n_threads)])
+        if gpu_layers is not None and str(gpu_layers).strip() != "":
+            cmd.extend(["--n-gpu-layers", str(gpu_layers)])
+        for item in extra_kv:
+            enabled_raw = item.get("enabled", True)
+            enabled = enabled_raw if isinstance(enabled_raw, bool) else str(enabled_raw).strip().lower() not in {"0", "false", "off", "no"}
+            if not enabled:
+                continue
+            key = (item.get("key") or "").strip()
+            value = (item.get("value") or "").strip()
+            if not key:
+                continue
+            if not key.startswith("-"):
+                key = f"--{key}"
+            cmd.append(key)
+            if value:
+                cmd.append(value)
+        if freeform_args.strip():
+            try:
+                cmd.extend(shlex.split(freeform_args, posix=(os.name != "nt")))
+            except Exception:
+                pass
+        return cmd
+    except Exception:
+        return []
 
 
 @app.get("/api/llama/discover")
