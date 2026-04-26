@@ -392,6 +392,18 @@ class InstanceManager:
         with path.open("r", encoding="utf-8", errors="replace") as f:
             return [line.rstrip("\n") for line in f.readlines()[-lines:]]
 
+    def _read_log_file_from(self, file_path: str, offset: int, limit: int) -> List[str]:
+        path = Path(file_path)
+        if not path.exists() or offset < 0 or limit <= 0:
+            return []
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            all_lines = f.readlines()
+            total = len(all_lines)
+            if offset >= total:
+                return []
+            start = max(0, offset - limit)
+            return [line.rstrip("\n") for line in all_lines[start:offset]]
+
     def _resolve_executable(self, server_dir: str) -> str:
         raw = (server_dir or "").strip()
         if not raw:
@@ -1134,6 +1146,31 @@ def get_logs(instance_id: str):
             "instance_id": instance_id,
             "status": matched["status"],
             "lines": manager._read_log_file_tail(matched["log_file"], lines),
+        }
+    )
+
+
+@app.get("/api/instances/<instance_id>/logs/before")
+def get_logs_before(instance_id: str):
+    offset = request.args.get("offset", type=int, default=0)
+    limit = request.args.get("limit", type=int, default=200)
+    limit = min(max(limit, 1), 500)
+
+    matched = None
+    for item in manager._list_persisted_instances():
+        if item["instance_id"] == instance_id:
+            matched = item
+            break
+
+    if not matched:
+        return jsonify({"error": "实例不存在"}), 404
+
+    lines = manager._read_log_file_from(matched["log_file"], offset, limit)
+    return jsonify(
+        {
+            "instance_id": instance_id,
+            "lines": lines,
+            "has_more": len(lines) == limit,
         }
     )
 

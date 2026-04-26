@@ -1,6 +1,11 @@
 const { createApp, ref, computed, onMounted, onUnmounted, nextTick } = Vue;
 
 const api = {
+  async getLogsBefore(instanceId, offset, limit = 200) {
+    const res = await fetch(`/api/instances/${instanceId}/logs/before?offset=${offset}&limit=${limit}`);
+    const data = await res.json();
+    return data;
+  },
   async getInstances() {
     const res = await fetch("/api/instances");
     return await res.json();
@@ -131,11 +136,19 @@ const InstanceList = {
 };
 
 const LogViewer = {
-  props: ["logs", "loading"],
+  props: ["logs", "loading", "cssClass", "emptyText"],
+  emits: ["loadMore"],
   data() {
     return {
-      autoScroll: true
+      autoScroll: true,
+      lastScrollHeight: 0,
+      loadingMore: false
     };
+  },
+  computed: {
+    isLoading() {
+      return this.loading || this.loadingMore;
+    }
   },
   watch: {
     logs: {
@@ -144,19 +157,26 @@ const LogViewer = {
         this.$nextTick(() => {
           if (this.autoScroll) {
             this.scrollToBottom();
+          } else {
+            this.keepScrollPosition();
           }
         });
+        this.loadingMore = false;
       },
       deep: true
     }
   },
   mounted() {
     this.updateContent();
+    this.$nextTick(() => {
+      this.scrollToBottom();
+    });
   },
   methods: {
     updateContent() {
       if (this.$refs.output) {
-        this.$refs.output.innerHTML = this.logs.length === 0 ? "请选择左侧实例以查看日志..." : this.logs.join("\n");
+        const emptyMsg = this.emptyText || "请选择左侧实例以查看日志...";
+        this.$refs.output.innerHTML = this.logs.length === 0 ? emptyMsg : this.logs.join("\n");
       }
     },
     scrollToBottom() {
@@ -165,17 +185,39 @@ const LogViewer = {
         el.scrollTop = el.scrollHeight;
       }
     },
+    keepScrollPosition() {
+      const el = this.$refs.output;
+      if (el && this.lastScrollHeight > 0) {
+        el.scrollTop = el.scrollHeight - this.lastScrollHeight;
+      }
+    },
     onScroll() {
       const el = this.$refs.output;
       if (!el) return;
+      this.lastScrollHeight = el.scrollHeight;
       const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight <= 50;
       this.autoScroll = atBottom;
+    },
+    onScrollTop() {
+      const el = this.$refs.output;
+      if (!el) return;
+      console.log("scrollTop:", el.scrollTop, "loadingMore:", this.loadingMore, "loading:", this.loading);
+      if (el.scrollTop <= 10 && !this.loadingMore && !this.loading) {
+        this.loadingMore = true;
+        console.log("emitting loadMore");
+        this.$emit("loadMore");
+        // 直接调用全局方法
+        if (window.loadMoreLogs) {
+          window.loadMoreLogs();
+        }
+      }
     }
   },
   template: `
     <pre
       ref="output"
-      :class="['log-output', { loading: loading }]"
+      :class="['log-output', cssClass, { loading: loading }]"
+      @scroll="onScroll(); onScrollTop()"
     ></pre>
   `
 };
@@ -408,48 +450,9 @@ const InstanceForm = {
 };
 
 const LogModal = {
-  props: ["logs"],
-  emits: ["close"],
-  data() {
-    return {
-      autoScroll: true
-    };
-  },
-  watch: {
-    logs: {
-      handler() {
-        this.updateContent();
-        this.$nextTick(() => {
-          if (this.autoScroll) {
-            this.scrollToBottom();
-          }
-        });
-      },
-      deep: true
-    }
-  },
-  mounted() {
-    this.updateContent();
-  },
-  methods: {
-    updateContent() {
-      if (this.$refs.output) {
-        this.$refs.output.innerHTML = this.logs.join("\n");
-      }
-    },
-    scrollToBottom() {
-      const el = this.$refs.output;
-      if (el) {
-        el.scrollTop = el.scrollHeight;
-      }
-    },
-    onScroll() {
-      const el = this.$refs.output;
-      if (!el) return;
-      const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight <= 50;
-      this.autoScroll = atBottom;
-    }
-  },
+  props: ["logs", "loading"],
+  emits: ["close", "loadMore"],
+  components: { LogViewer },
   template: `
     <div class="log-modal" @click.self="$emit('close')">
       <div class="log-modal-card-full">
@@ -457,7 +460,7 @@ const LogModal = {
           <strong>日志放大查看</strong>
           <button type="button" @click="$emit('close')">✕</button>
         </div>
-        <pre ref="output" class="log-output-large"></pre>
+        <log-viewer :logs="logs" :loading="loading" :cssClass="'log-output-large'" :emptyText="'暂无日志'" @loadMore="$emit('loadMore')"></log-viewer>
       </div>
     </div>
   `
@@ -477,6 +480,8 @@ const app = createApp({
       selectedInstanceId: null,
       currentLogs: [],
       logLoading: false,
+      logLoadMoreLoading: false,
+      logOffset: 0,
       daemonStatus: { running: false, pid: null },
       daemonLoading: false,
       showForm: false,
@@ -498,11 +503,18 @@ const app = createApp({
   mounted() {
     this.initSSE();
     this.refreshInstances();
+    // 暴露方法到 window
+    window.appVm = this;
   },
   beforeUnmount() {
     this.closeStreams();
   },
   methods: {
+    testClick() {
+      console.log("按钮被点击了");
+      this.showLogLarge = true;
+      console.log("showLogLarge:", this.showLogLarge);
+    },
     initSSE() {
       this.daemonStream = new EventSource("/api/daemon/status/stream");
       this.daemonStream.addEventListener("status", (e) => {
@@ -547,21 +559,44 @@ const app = createApp({
       }
       this.logLoading = true;
       this.currentLogs = [];
+      this.logOffset = 0;
       this.logStream = new EventSource(`/api/instances/${id}/logs/stream?lines=300`);
       this.logStream.addEventListener("snapshot", (e) => {
         this.logLoading = false;
         const data = JSON.parse(e.data || "{}");
         this.currentLogs = data.lines || [];
+        this.logOffset = this.currentLogs.length;
       });
       this.logStream.addEventListener("append", (e) => {
         const data = JSON.parse(e.data || "{}");
         if (data.line) {
           this.currentLogs.push(data.line);
+          this.logOffset = this.currentLogs.length;
         }
       });
       this.logStream.onerror = () => {
         this.logLoading = false;
       };
+    },
+    async loadMoreLogs() {
+      console.log("loadMoreLogs called", this.selectedInstanceId, this.logOffset);
+      if (this.logLoadMoreLoading || !this.selectedInstanceId) return;
+      this.logLoadMoreLoading = true;
+      try {
+        console.log("Fetching logs before offset:", this.logOffset);
+        const data = await api.getLogsBefore(this.selectedInstanceId, this.logOffset, 200);
+        console.log("Got logs:", data);
+        if (data.lines && data.lines.length > 0) {
+          this.currentLogs = [...data.lines, ...this.currentLogs];
+          this.logOffset = this.currentLogs.length;
+        } else {
+          console.log("No more logs to load");
+        }
+      } catch (e) {
+        console.error(e);
+      } finally {
+        this.logLoadMoreLoading = false;
+      }
     },
     openForm(instance) {
       this.editingInstance = instance;
@@ -614,3 +649,12 @@ const app = createApp({
 });
 
 app.mount("#app");
+
+window.loadMoreLogs = function() {
+  console.log("window.loadMoreLogs called", window.appVm);
+  if (window.appVm) {
+    window.appVm.loadMoreLogs();
+  } else {
+    console.log("appVm not found");
+  }
+};

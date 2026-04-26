@@ -45,12 +45,13 @@
             <h2>日志查看</h2>
             <div class="log-head-actions">
               <span id="currentInstance">{{ currentInstanceName }}</span>
-              <button id="enlargeLogBtn" type="button" title="放大查看" @click="showLogLarge = true">⛶</button>
+              <button id="enlargeLogBtn" type="button" class="enlarge-btn" title="放大查看" @click="showLogLarge = true">⛶</button>
             </div>
           </div>
           <log-viewer
             :logs="currentLogs"
             :loading="logLoading"
+            @loadMore="loadMoreLogs"
           ></log-viewer>
         </section>
       </main>
@@ -66,6 +67,8 @@
       <log-modal
         v-if="showLogLarge"
         :logs="currentLogs"
+        :loading="logLoading"
+        @loadMore="loadMoreLogs"
         @close="showLogLarge = false"
       ></log-modal>
     </div>

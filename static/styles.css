@@ -179,7 +179,7 @@ h1, h2 {
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 24px;
+  padding: 0;
   z-index: 999;
 }
 
@@ -205,6 +205,7 @@ h1, h2 {
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  border-radius: 0;
 }
 
 .log-modal-head {
