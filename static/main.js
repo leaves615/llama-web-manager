@@ -500,7 +500,8 @@ data() {
         previewText: "尚未生成",
         versionOptions: [],
         modelOptions: [],
-        nCtxOptions: ["2048", "4096", "8192", "16384", "32768", "65536", "131072", "262144", "524288", "1048576"]
+        nCtxOptions: ["2048", "4096", "8192", "16384", "32768", "65536", "131072", "262144", "524288", "1048576"],
+        activeTab: 'params'
       };
     },
   computed: {
@@ -669,144 +670,183 @@ data() {
         <button type="button" @click="$emit('close')">✕</button>
       </div>
       <div class="form-modal-body">
-        <div class="form-section">
-          <div class="section-title">实例信息</div>
-          <div class="form-grid">
-            <div class="form-group">
-              <label>实例名称</label>
-              <input v-model="name" placeholder="例如: qa-model-a" />
+        <!-- 左侧 38% -->
+        <div class="form-left">
+          <!-- 实例信息 -->
+          <div class="form-section">
+            <div class="section-title">实例信息</div>
+            <div class="form-grid">
+              <div class="form-group">
+                <label>实例名称</label>
+                <input v-model="name" placeholder="例如: qa-model-a" />
+              </div>
+              <div class="form-group">
+                <label>llama 启动路径</label>
+                <input v-model="serverDir" placeholder="目录或可执行文件" />
+              </div>
+              <div class="form-group full-width">
+                <label>或选择扫描版本</label>
+                <select v-model="serverDir">
+                  <option value="">请选择</option>
+                  <option v-for="v in versionOptions" :key="v.value" :value="v.value">{{ v.label }}</option>
+                </select>
+              </div>
             </div>
-            <div class="form-group">
-              <label>llama 启动路径</label>
-              <input v-model="serverDir" placeholder="目录或可执行文件" />
+          </div>
+
+          <!-- 模型配置 -->
+          <div class="form-section">
+            <div class="section-title">模型配置</div>
+            <div class="form-grid">
+              <div class="form-group">
+                <label>Model 路径</label>
+                <input v-model="modelPath" placeholder="例如: D:\models\qwen.gguf" />
+              </div>
+              <div class="form-group">
+                <label>或选择扫描模型</label>
+                <select v-model="modelPath">
+                  <option value="">请选择</option>
+                  <option v-for="m in modelOptions" :key="m.value" :value="m.value">{{ m.label }}</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label>草稿模型路径</label>
+                <input v-model="draftModelPath" placeholder="可选的加速模型" />
+              </div>
+              <div class="form-group">
+                <label>或选择扫描模型</label>
+                <select v-model="draftModelPath">
+                  <option value="">请选择</option>
+                  <option v-for="m in modelOptions" :key="m.value" :value="m.value">{{ m.label }}</option>
+                </select>
+              </div>
             </div>
-            <div class="form-group full-width">
-              <label>或选择扫描版本</label>
-              <select v-model="serverDir">
-                <option value="">请选择</option>
-                <option v-for="v in versionOptions" :key="v.value" :value="v.value">{{ v.label }}</option>
-              </select>
+          </div>
+
+          <!-- 草稿模型参数 -->
+          <div class="form-section" v-if="hasDraftModel">
+            <div class="section-title">草稿模型参数</div>
+            <div class="form-grid two">
+              <div class="form-group">
+                <label>最大草稿数</label>
+                <input v-model="draftMax" type="number" placeholder="16" />
+              </div>
+              <div class="form-group">
+                <label>最小草稿数</label>
+                <input v-model="draftMin" type="number" placeholder="4" />
+              </div>
             </div>
+          </div>
+
+          <!-- 服务器配置 -->
+          <div class="form-section">
+            <div class="section-title">服务器配置</div>
+            <div class="form-grid four">
+              <div class="form-group">
+                <label>Host</label>
+                <input v-model="host" />
+              </div>
+              <div class="form-group">
+                <label>Port</label>
+                <input v-model="port" type="number" />
+              </div>
+              <div class="form-group">
+                <label>Threads</label>
+                <input v-model="nThreads" type="number" />
+              </div>
+              <div class="form-group">
+                <label>GPU Layers</label>
+                <input v-model="gpuLayers" type="number" />
+              </div>
+            </div>
+            <div class="form-grid">
+              <div class="form-group">
+                <label>Context Size</label>
+                <select v-model="nCtx">
+                  <option v-for="c in nCtxOptionsFormatted" :key="c.value" :value="c.value">{{ c.label }}</option>
+                </select>
+              </div>
+            </div>
+          </div>
+
+          <!-- 命令预览 -->
+          <div class="form-section">
+            <div class="section-title">命令预览</div>
+            <button type="button" class="small" @click="preview">刷新预览</button>
+            <pre class="command-preview">{{ previewText }}</pre>
+          </div>
+
+          <!-- 表单操作 -->
+          <div class="form-actions">
+            <button type="button" class="primary" @click="save" :class="{ loading: loading }">
+              {{ isEdit ? '保存并重启' : '创建实例' }}
+            </button>
           </div>
         </div>
 
-<div class="form-section">
-          <div class="section-title">模型配置</div>
-          <div class="form-grid">
-            <div class="form-group">
-              <label>Model 路径</label>
-              <input v-model="modelPath" placeholder="例如: D:\models\qwen.gguf" />
-            </div>
-            <div class="form-group">
-              <label>或选择扫描模型</label>
-              <select v-model="modelPath">
-                <option value="">请选择</option>
-                <option v-for="m in modelOptions" :key="m.value" :value="m.value">{{ m.label }}</option>
-              </select>
-            </div>
-            <div class="form-group">
-              <label>草稿模型路径</label>
-              <input v-model="draftModelPath" placeholder="可选的加速模型" />
-            </div>
-            <div class="form-group">
-              <label>或选择扫描模型</label>
-              <select v-model="draftModelPath">
-                <option value="">请选择</option>
-                <option v-for="m in modelOptions" :key="m.value" :value="m.value">{{ m.label }}</option>
-              </select>
-            </div>
+        <!-- 右侧 62% - Tab 容器 -->
+        <div class="form-right">
+          <!-- Tab Header -->
+          <div class="tab-header">
+            <button 
+              :class="['tab-btn', { active: activeTab === 'params' }]"
+              @click="activeTab = 'params'"
+            >
+              参数
+            </button>
+            <button 
+              :class="['tab-btn', { active: activeTab === 'env' }]"
+              @click="activeTab = 'env'"
+            >
+              环境变量
+            </button>
           </div>
-        </div>
 
-        <div class="form-section" v-if="hasDraftModel">
-          <div class="section-title">草稿模型参数</div>
-          <div class="form-grid two">
-            <div class="form-group">
-              <label>最大草稿数</label>
-              <input v-model="draftMax" type="number" placeholder="16" />
-            </div>
-            <div class="form-group">
-              <label>最小草稿数</label>
-              <input v-model="draftMin" type="number" placeholder="4" />
-            </div>
-          </div>
-        </div>
+          <!-- Tab Content -->
+          <div class="tab-content">
+            <!-- Tab 1: 参数 -->
+            <div v-show="activeTab === 'params'" class="tab-pane">
+              <!-- 额外参数 -->
+              <div class="form-section">
+                <div class="section-title">
+                  额外参数
+                  <button type="button" class="small" @click="addFlag">+ 添加</button>
+                </div>
+                <div v-for="(flag, idx) in extraFlags" :key="idx" class="flag-row">
+                  <input v-model="flag.key" placeholder="--temp" />
+                  <input v-model="flag.value" placeholder="0.8" />
+                  <label class="flag-enable">
+                    <input type="checkbox" v-model="flag.enabled" />启用
+                  </label>
+                  <button type="button" class="danger small" @click="removeFlag(idx)">删除</button>
+                </div>
+              </div>
 
-        <div class="form-section">
-          <div class="section-title">服务器配置</div>
-          <div class="form-grid four">
-            <div class="form-group">
-              <label>Host</label>
-              <input v-model="host" />
+              <!-- 自由文本参数 -->
+              <div class="form-section">
+                <div class="section-title">自由文本参数</div>
+                <textarea v-model="freeform" rows="3" placeholder="例如: --temp 0.7 --top-p 0.9"></textarea>
+              </div>
             </div>
-            <div class="form-group">
-              <label>Port</label>
-              <input v-model="port" type="number" />
-            </div>
-            <div class="form-group">
-              <label>Threads</label>
-              <input v-model="nThreads" type="number" />
-            </div>
-            <div class="form-group">
-              <label>GPU Layers</label>
-              <input v-model="gpuLayers" type="number" />
-            </div>
-          </div>
-          <div class="form-grid">
-            <div class="form-group">
-              <label>Context Size</label>
-              <select v-model="nCtx">
-                <option v-for="c in nCtxOptionsFormatted" :key="c.value" :value="c.value">{{ c.label }}</option>
-              </select>
+
+            <!-- Tab 2: 环境变量 -->
+            <div v-show="activeTab === 'env'" class="tab-pane">
+              <div class="form-section">
+                <div class="section-title">
+                  环境变量
+                  <button type="button" class="small" @click="addEnvVar">+ 添加</button>
+                </div>
+                <div v-for="(env, idx) in envVars" :key="idx" class="flag-row">
+                  <input v-model="env.key" placeholder="KEY" />
+                  <input v-model="env.value" placeholder="value" />
+                  <label class="flag-enable">
+                    <input type="checkbox" v-model="env.enabled" />启用
+                  </label>
+                  <button type="button" class="danger small" @click="removeEnvVar(idx)">删除</button>
+                </div>
+              </div>
             </div>
           </div>
-        </div>
-
-      <div class="form-section">
-          <div class="section-title">
-            额外参数
-            <button type="button" class="small" @click="addFlag">+ 添加</button>
-          </div>
-          <div v-for="(flag, idx) in extraFlags" :key="idx" class="flag-row">
-            <input v-model="flag.key" placeholder="--temp" />
-            <input v-model="flag.value" placeholder="0.8" />
-            <label class="flag-enable">
-              <input type="checkbox" v-model="flag.enabled" />启用
-            </label>
-            <button type="button" class="danger small" @click="removeFlag(idx)">删除</button>
-          </div>
-        </div>
-
-        <div class="form-section">
-          <div class="section-title">
-            环境变量
-            <button type="button" class="small" @click="addEnvVar">+ 添加</button>
-          </div>
-          <div v-for="(env, idx) in envVars" :key="idx" class="flag-row">
-            <input v-model="env.key" placeholder="KEY" />
-            <input v-model="env.value" placeholder="value" />
-            <label class="flag-enable">
-              <input type="checkbox" v-model="env.enabled" />启用
-            </label>
-            <button type="button" class="danger small" @click="removeEnvVar(idx)">删除</button>
-          </div>
-        </div>
-
-        <div class="form-section">
-          <div class="section-title">自由文本参数</div>
-          <textarea v-model="freeform" rows="2" placeholder="例如: --temp 0.7 --top-p 0.9"></textarea>
-        </div>
-
-        <div class="form-actions">
-          <button type="button" @click="preview" :class="{ loading: false }">命令预览</button>
-          <button type="button" class="primary" @click="save" :class="{ loading: loading }">
-            {{ isEdit ? '保存并重启' : '创建实例' }}
-          </button>
-        </div>
-
-        <div class="preview">
-          <div class="preview-label">命令预览</div>
-          <pre>{{ previewText }}</pre>
         </div>
       </div>
     </div>
