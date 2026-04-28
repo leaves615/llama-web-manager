@@ -118,8 +118,9 @@ def kill_process_tree(pid: int, include_parent: bool = True) -> bool:
     return parent.is_running() == False
 
 
-def utc_now_iso():
-    return dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+def now_iso():
+    """返回本地时间的 ISO 格式字符串（毫秒精度，无时区信息）"""
+    return dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
 
 
 def load_config() -> Dict:
@@ -240,8 +241,8 @@ class LlamaInstance:
     def _start_log_capture(self):
         def capture():
             with self.log_file.open("a", encoding="utf-8") as f:
-                f.write(f"\n[{utc_now_iso()}] === Daemon attached, logging started ===\n")
-                f.write(f"[{utc_now_iso()}] command: {' '.join(self.command)}\n")
+                f.write(f"\n[{now_iso()}] === Daemon attached, logging started ===\n")
+                f.write(f"[{now_iso()}] command: {' '.join(self.command)}\n")
                 f.flush()
 
                 stdout = self.process.stdout
@@ -250,7 +251,7 @@ class LlamaInstance:
 
                 for line in stdout:
                     clean = line.rstrip("\n")
-                    msg = f"[{utc_now_iso()}] {clean}"
+                    msg = f"[{now_iso()}] {clean}"
                     f.write(msg + "\n")
                     f.flush()
 
@@ -262,7 +263,7 @@ class LlamaInstance:
                         return_code = -1
                         self.process.kill()
 
-                ended = f"[{utc_now_iso()}] process exited with code {return_code}"
+                ended = f"[{now_iso()}] process exited with code {return_code}"
                 f.write(ended + "\n")
                 f.flush()
 
@@ -564,7 +565,7 @@ class DaemonManager:
         if rows:
             daemon_logger.info(f"Processing {len(rows)} start command(s)")
         for row in rows:
-            self._start_instance(row)
+            self._start_instance_from_row(row)
 
         cursor = self._db_execute("SELECT * FROM instances WHERE command = 'stop'")
         rows = cursor.fetchall()
@@ -606,7 +607,7 @@ class DaemonManager:
 
             self._db_execute(
                 "UPDATE instances SET pid = ?, status = 'running', command = NULL, updated_at = ? WHERE instance_id = ?",
-                (instance.pid, utc_now_iso(), instance_id),
+                (instance.pid, now_iso(), instance_id),
             )
             daemon_logger.info(f"Started {instance.name}")
             return instance
@@ -614,7 +615,7 @@ class DaemonManager:
             daemon_logger.error(f"Failed to start {instance_id}: {e}")
             self._db_execute(
                 "UPDATE instances SET status = 'error', command = NULL, updated_at = ? WHERE instance_id = ?",
-                (utc_now_iso(), instance_id),
+                (now_iso(), instance_id),
             )
             return None
 
@@ -639,7 +640,7 @@ class DaemonManager:
                 del self.instances[instance_id]
             self._db_execute(
                 "UPDATE instances SET pid = NULL, status = 'stopped', command = NULL, updated_at = ? WHERE instance_id = ?",
-                (utc_now_iso(), instance_id),
+                (now_iso(), instance_id),
             )
 
     def check_status(self):
@@ -648,7 +649,7 @@ class DaemonManager:
             if instance.status == "stopped":
                 self._db_execute(
                     "UPDATE instances SET status = 'stopped', pid = NULL, updated_at = ? WHERE instance_id = ?",
-                    (utc_now_iso(), instance_id),
+                    (now_iso(), instance_id),
                 )
                 to_remove.append(instance_id)
 
@@ -668,13 +669,13 @@ class DaemonManager:
                 if status not in (psutil.STATUS_RUNNING, psutil.STATUS_SLEEPING):
                     self._db_execute(
                         "UPDATE instances SET status = 'exited', pid = NULL, updated_at = ? WHERE instance_id = ?",
-                        (utc_now_iso(), instance_id),
+                        (now_iso(), instance_id),
                     )
                     daemon_logger.warning(f"Instance {instance_id} process exited (status: {status})")
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 self._db_execute(
                     "UPDATE instances SET status = 'exited', pid = NULL, updated_at = ? WHERE instance_id = ?",
-                    (utc_now_iso(), instance_id),
+                    (now_iso(), instance_id),
                 )
                 daemon_logger.warning(f"Instance {instance_id} process not found")
 

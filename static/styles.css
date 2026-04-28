@@ -164,6 +164,11 @@ h1, h2 {
   word-break: break-all;
 }
 
+.log-line {
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
 .log-output-large {
   flex: 1;
   background: #1a1d24;

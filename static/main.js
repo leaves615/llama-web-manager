@@ -142,7 +142,8 @@ const LogViewer = {
     return {
       autoScroll: true,
       lastScrollHeight: 0,
-      loadingMore: false
+      loadingMore: false,
+      _stack: []
     };
   },
   computed: {
@@ -176,11 +177,242 @@ const LogViewer = {
     });
   },
   methods: {
+     getColorMap() {
+       return {
+         '0': '', '1': 'font-weight:bold', '2': 'opacity:.5', '3': 'font-style:italic',
+         '4': 'text-decoration:underline', '7': 'background:#555;color:#fff',
+         '9': 'text-decoration:line-through',
+         '22': 'font-weight:normal;opacity:1', '23': 'font-style:normal',
+         '24': 'text-decoration:none', '27': 'background:transparent;color:inherit',
+         '29': 'text-decoration:none',
+         '30': 'color:#000','31': 'color:#d32f2f','32': 'color:#388e3c','33': 'color:#f9a825',
+         '34': 'color:#1976d2','35': 'color:#7b1fa2','36': 'color:#00838f','37': 'color:#bdbdbd',
+         '90': 'color:#757575','91': 'color:#ef5350','92': 'color:#66bb6a','93': 'color:#ffee58',
+         '94': 'color:#42a5f5','95': 'color:#ab47bc','96': 'color:#26c6da','97': 'color:#e0e0e0',
+         '40': 'background:#000','41': 'background:#d32f2f','42': 'background:#388e3c',
+         '43': 'background:#f9a825','44': 'background:#1976d2','45': 'background:#7b1fa2',
+         '46': 'background:#00838f','47': 'background:#bdbdbd',
+         '100': 'background:#757575','101': 'background:#ef5350','102': 'background:#66bb6a',
+         '103': 'background:#ffee58','104': 'background:#42a5f5','105': 'background:#ab47bc',
+         '106': 'background:#26c6da','107': 'background:#e0e0e0'
+       };
+     },
+     getcolorMap(code) {
+       return this.getColorMap()[code] || '';
+     },
+     ansi256ToCss(n) {
+       if (n < 0 || n > 255) return '';
+       if (n < 8) {
+         var colors = ['#000000','#cd0000','#00cd00','#cdcd00','#0000ee','#cd00cd','#00cdcd','#e5e5e5'];
+         return colors[n];
+       } else if (n < 16) {
+         var colors = ['#7f7f7f','#ff0000','#00ff00','#ffff00','#5c5cff','#ff00ff','#00ffff','#ffffff'];
+         return colors[n - 8];
+       } else if (n < 232) {
+         var idx = n - 16;
+         var r = Math.floor(idx / 36) * 51;
+         var g = Math.floor((idx % 36) / 6) * 51;
+         var b = (idx % 6) * 51;
+         return 'rgb(' + r + ',' + g + ',' + b + ')';
+       } else {
+         var gray = (n - 232) * 10 + 8;
+         return 'rgb(' + gray + ',' + gray + ',' + gray + ')';
+       }
+     },
     updateContent() {
-      if (this.$refs.output) {
-        const emptyMsg = this.emptyText || "请选择左侧实例以查看日志...";
-        this.$refs.output.innerHTML = this.logs.length === 0 ? emptyMsg : this.logs.join("\n");
+        if (this.$refs.output) {
+          const emptyMsg = this.emptyText || "请选择左侧实例以查看日志...";
+          if (this.logs.length === 0) {
+            this.$refs.output.innerHTML = emptyMsg;
+          } else {
+            var html = '';
+            for (var i = 0; i < this.logs.length; i++) {
+              html += '<div class="log-line">' + this.parseAndHighlight(this.logs[i]) + '</div>';
+            }
+            this.$refs.output.innerHTML = html;
+          }
+        }
+      },
+     parseAndHighlight(text) {
+       var hiMap = this.buildSyntaxHighlightMap(text);
+       var segments = [];
+       var currentStyle = '';
+       var currentText = '';
+       var i = 0;
+       var len = text.length;
+
+       while (i < len) {
+         if (text[i] === '\x1b' && i + 1 < len && text[i + 1] === '[') {
+           var ansiMatch = this.parseAnsiSequence(text.slice(i));
+           if (ansiMatch) {
+             if (currentText) {
+               segments.push({ text: currentText, colorStyle: currentStyle });
+               currentText = '';
+             }
+             var style = this.ansiToCss(ansiMatch.codes);
+             if (style === 'RESET') {
+               currentStyle = '';
+             } else if (style) {
+               var merged = [];
+               if (currentStyle) merged.push(...currentStyle.split(';').filter(Boolean));
+               merged.push(...style.split(';').filter(Boolean));
+               currentStyle = merged.join(';');
+             }
+             i += ansiMatch.length;
+             continue;
+           }
+         }
+         if (text[i] === '\x1b') { i++; continue; }
+         currentText += text[i];
+         i++;
+       }
+       if (currentText) {
+         segments.push({ text: currentText, colorStyle: currentStyle });
+       }
+
+       var html = '';
+       var segStart = 0;
+       for (var si = 0; si < segments.length; si++) {
+         var seg = segments[si];
+         var hiMapPart = {};
+         for (var k = segStart; k < segStart + seg.text.length; k++) {
+           if (hiMap[k]) {
+             hiMapPart[k] = hiMap[k];
+           }
+         }
+         html += this.renderSegment(seg.text, seg.colorStyle, hiMapPart);
+         segStart += seg.text.length;
+       }
+       return html;
+     },
+     parseAnsiSequence(text) {
+       var i = 0;
+       if (text[i] !== '\x1b') return null;
+       i++;
+       if (i >= text.length || text[i] !== '[') return null;
+       i++;
+       var codes = [];
+       var num = '';
+       while (i < text.length) {
+         var ch = text[i];
+         if (ch >= '0' && ch <= '9') {
+           num += ch;
+           i++;
+         } else if (ch === ';') {
+           codes.push(num || '0');
+           num = '';
+           i++;
+         } else if (ch === 'm') {
+           codes.push(num || '0');
+           return { codes: codes, length: i + 1 };
+         } else {
+           return null;
+         }
+       }
+       return null;
+     },
+     ansiToCss(codes) {
+       var styles = [];
+       var i = 0;
+       while (i < codes.length) {
+         var code = codes[i];
+         if (code === '0' || code === '') {
+           return 'RESET';
+         } else if (code === '38' || code === '48') {
+           var isFg = code === '38';
+           if (i + 1 < codes.length) {
+             if (codes[i + 1] === '5' && i + 2 < codes.length) {
+               var color = this.ansi256ToCss(parseInt(codes[i + 2]));
+               if (color) {
+                 styles.push(isFg ? 'color:' + color : 'background:' + color);
+               }
+               i += 3;
+               continue;
+             } else if (codes[i + 1] === '2' && i + 4 < codes.length) {
+               var r = parseInt(codes[i + 2]) || 0;
+               var g = parseInt(codes[i + 3]) || 0;
+               var b = parseInt(codes[i + 4]) || 0;
+               var rgb = 'rgb(' + r + ',' + g + ',' + b + ')';
+               styles.push(isFg ? 'color:' + rgb : 'background:' + rgb);
+               i += 5;
+               continue;
+             }
+           }
+           i++;
+           continue;
+         } else {
+           var s = this.getcolorMap(code);
+           if (s) styles.push(s);
+           i++;
+         }
+       }
+       return styles.join(';');
+     },
+    renderSegment(text, baseStyle, hiMap) {
+        if (!hiMap || Object.keys(hiMap).length === 0) {
+          if (baseStyle) {
+            return '<span style="' + baseStyle + '">' + this.escapeHtml(text) + '</span>';
+          }
+          return this.escapeHtml(text);
+        }
+        var escaped = this.escapeHtml(text);
+        var result = '';
+        var lastIdx = 0;
+        var i = 0;
+        var hiColor = '#8b8ff7';
+        
+        while (i < text.length) {
+          if (hiMap[i]) {
+            if (lastIdx < i) {
+              if (baseStyle) {
+                result += '<span style="' + baseStyle + '">' + escaped.substring(lastIdx, i) + '</span>';
+              } else {
+                result += escaped.substring(lastIdx, i);
+              }
+            }
+            result += '<span style="color:' + hiColor + '">' + escaped[i];
+            lastIdx = i + 1;
+            i++;
+            while (i < text.length && hiMap[i]) {
+              result += escaped[i];
+              lastIdx = i + 1;
+              i++;
+            }
+            result += '</span>';
+          } else {
+            i++;
+          }
+        }
+        if (lastIdx < text.length) {
+          if (baseStyle) {
+            result += '<span style="' + baseStyle + '">' + escaped.substring(lastIdx, text.length) + '</span>';
+          } else {
+            result += escaped.substring(lastIdx, text.length);
+          }
+        }
+        return result;
+      },
+    buildSyntaxHighlightMap(text) {
+      var patterns = [
+        { regex: /\[(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+)\]/g, color: '#8b8ff7', priority: 5, skipAnsi: true }
+      ];
+      var positions = {};
+      for (var pi = 0; pi < patterns.length; pi++) {
+        var p = patterns[pi];
+        p.regex.lastIndex = 0;
+        var match;
+        while ((match = p.regex.exec(text)) !== null) {
+          for (var ii = match.index; ii < match.index + match[0].length; ii++) {
+            if (!positions[ii] || positions[ii].priority < p.priority) {
+              positions[ii] = { color: p.color, priority: p.priority, skipAnsi: p.skipAnsi || false };
+            }
+          }
+        }
       }
+      return positions;
+    },
+   escapeHtml(str) {
+      return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
     },
     scrollToBottom() {
       const el = this.$refs.output;
@@ -216,11 +448,11 @@ const LogViewer = {
   },
   template: `
     <div class="log-wrapper">
-      <pre
+      <div
         ref="output"
         :class="['log-output', cssClass, { loading: loading }]"
         @scroll="onScroll(); onScrollTop()"
-      ></pre>
+      ></div>
       <button
         v-if="showScrollLatest"
         class="scroll-latest-btn"
@@ -234,6 +466,7 @@ const LogViewer = {
     </div>
   `
 };
+
 
 const InstanceForm = {
   props: ["instance", "loading"],
@@ -381,7 +614,7 @@ data() {
     removeEnvVar(index) {
       this.envVars.splice(index, 1);
     },
-    async preview() {
+   async preview() {
       const payload = this.collectPayload();
       try {
         const data = await api.previewCommand(payload);
@@ -394,7 +627,7 @@ data() {
       clearTimeout(this._previewTimer);
       this._previewTimer = setTimeout(() => this.preview(), 300);
     },
-    collectPayload() {
+   collectPayload() {
       return {
         name: this.name.trim(),
         server_dir: this.serverDir.trim(),
@@ -519,7 +752,7 @@ data() {
           </div>
         </div>
 
-<div class="form-section">
+      <div class="form-section">
           <div class="section-title">
             额外参数
             <button type="button" class="small" @click="addFlag">+ 添加</button>
@@ -546,20 +779,6 @@ data() {
               <input type="checkbox" v-model="env.enabled" />启用
             </label>
             <button type="button" class="danger small" @click="removeEnvVar(idx)">删除</button>
-          </div>
-        </div>
-
-<div class="form-section">
-          <div class="section-title">自由文本参数</div>
-          <textarea v-model="freeform" rows="2" placeholder="例如：--temp 0.7 --top-p 0.9"></textarea>
-        </div>
-          <div v-for="(flag, idx) in extraFlags" :key="idx" class="flag-row">
-            <input v-model="flag.key" placeholder="--temp" />
-            <input v-model="flag.value" placeholder="0.8" />
-            <label class="flag-enable">
-              <input type="checkbox" v-model="flag.enabled" />启用
-            </label>
-            <button type="button" class="danger small" @click="removeFlag(idx)">删除</button>
           </div>
         </div>
 
@@ -694,7 +913,7 @@ const app = createApp({
       this.selectedInstanceId = id;
       this.startLogStream(id);
     },
-    startLogStream(id) {
+  startLogStream(id) {
       if (this.logStream) {
         this.logStream.close();
       }
@@ -743,7 +962,7 @@ const app = createApp({
       this.editingInstance = { ...rest, name: name + " (副本)" };
       this.showForm = true;
     },
-    async saveForm(payload) {
+  async saveForm(payload) {
       this.formLoading = true;
       try {
         if (this.editingInstance?.instance_id) {

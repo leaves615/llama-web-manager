@@ -801,16 +801,17 @@ class InstanceManager:
                 "false",
                 "off",
                 "no",
+                "",
             }
             if not enabled:
                 continue
 
             key = (item.get("key") or "").strip()
-            value = (item.get("value") or "").strip()
             if not key:
                 continue
             if not key.startswith("-"):
                 key = f"--{key}"
+            value = (item.get("value") or "").strip()
             cmd.append(key)
             if value:
                 cmd.append(value)
