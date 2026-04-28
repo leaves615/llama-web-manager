@@ -142,6 +142,7 @@ const LogViewer = {
     return {
       autoScroll: true,
       lastScrollHeight: 0,
+      lastScrollTop: 0,
       loadingMore: false,
       _stack: []
     };
@@ -370,7 +371,17 @@ const LogViewer = {
                 result += escaped.substring(lastIdx, i);
               }
             }
-            result += '<span style="color:' + hiColor + '">' + escaped[i];
+            // 合并 baseStyle 和高亮颜色：保留 baseStyle 中的非颜色属性，用 hiColor 替换颜色
+            var highlightStyle = 'color:' + hiColor;
+            if (baseStyle) {
+              var baseStyleParts = baseStyle.split(';').filter(function(s) { 
+                return s.trim() && !s.trim().startsWith('color:'); 
+              });
+              if (baseStyleParts.length > 0) {
+                highlightStyle = baseStyleParts.join(';') + ';' + highlightStyle;
+              }
+            }
+            result += '<span style="' + highlightStyle + '">' + escaped[i];
             lastIdx = i + 1;
             i++;
             while (i < text.length && hiMap[i]) {
@@ -418,31 +429,30 @@ const LogViewer = {
       const el = this.$refs.output;
       if (el) {
         el.scrollTop = el.scrollHeight;
+        this.lastScrollTop = el.scrollTop;
+        this.lastScrollHeight = el.scrollHeight;
       }
       this.autoScroll = true;
     },
     keepScrollPosition() {
       const el = this.$refs.output;
       if (el && this.lastScrollHeight > 0) {
-        el.scrollTop = el.scrollHeight - this.lastScrollHeight;
+        el.scrollTop = Math.max(0, el.scrollHeight - this.lastScrollHeight + this.lastScrollTop);
+        this.lastScrollTop = el.scrollTop;
+        this.lastScrollHeight = el.scrollHeight;
       }
     },
     onScroll() {
       const el = this.$refs.output;
       if (!el) return;
+      const previousScrollTop = this.lastScrollTop;
+      this.lastScrollTop = el.scrollTop;
       this.lastScrollHeight = el.scrollHeight;
       const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight <= 50;
       this.autoScroll = atBottom;
-    },
-    onScrollTop() {
-      const el = this.$refs.output;
-      if (!el) return;
-      if (el.scrollTop <= 10 && !this.loadingMore && !this.loading) {
+      if (previousScrollTop > el.scrollTop && el.scrollTop <= 10 && !this.loadingMore && !this.loading) {
         this.loadingMore = true;
         this.$emit("loadMore");
-        if (window.loadMoreLogs) {
-          window.loadMoreLogs();
-        }
       }
     }
   },
@@ -451,7 +461,7 @@ const LogViewer = {
       <div
         ref="output"
         :class="['log-output', cssClass, { loading: loading }]"
-        @scroll="onScroll(); onScrollTop()"
+        @scroll="onScroll"
       ></div>
       <button
         v-if="showScrollLatest"
@@ -925,13 +935,12 @@ const app = createApp({
         this.logLoading = false;
         const data = JSON.parse(e.data || "{}");
         this.currentLogs = data.lines || [];
-        this.logOffset = this.currentLogs.length;
+        this.logOffset = Number.isFinite(data.start_offset) ? data.start_offset : Math.max(0, this.currentLogs.length);
       });
       this.logStream.addEventListener("append", (e) => {
         const data = JSON.parse(e.data || "{}");
         if (data.line) {
           this.currentLogs.push(data.line);
-          this.logOffset = this.currentLogs.length;
         }
       });
       this.logStream.onerror = () => {
@@ -939,13 +948,13 @@ const app = createApp({
       };
     },
     async loadMoreLogs() {
-      if (this.logLoadMoreLoading || !this.selectedInstanceId) return;
+      if (this.logLoadMoreLoading || !this.selectedInstanceId || this.logOffset <= 0) return;
       this.logLoadMoreLoading = true;
       try {
         const data = await api.getLogsBefore(this.selectedInstanceId, this.logOffset, 200);
         if (data.lines && data.lines.length > 0) {
           this.currentLogs = [...data.lines, ...this.currentLogs];
-          this.logOffset = this.currentLogs.length;
+          this.logOffset = Math.max(0, this.logOffset - data.lines.length);
         }
       } catch (e) {
         console.error(e);
@@ -1009,9 +1018,3 @@ const app = createApp({
 });
 
 app.mount("#app");
-
-window.loadMoreLogs = function() {
-  if (window.appVm) {
-    window.appVm.loadMoreLogs();
-  }
-};

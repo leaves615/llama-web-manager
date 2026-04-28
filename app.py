@@ -1285,6 +1285,7 @@ def stream_logs(instance_id: str):
                         f.seek(0)
                         all_lines = f.readlines()
                         tail_lines = all_lines[-lines:] if len(all_lines) > lines else all_lines
+                        start_offset = max(0, len(all_lines) - len(tail_lines))
                         last_pos = file_size
                         snapshot_sent = True
                         yield _sse_event(
@@ -1293,6 +1294,7 @@ def stream_logs(instance_id: str):
                                 "instance_id": instance_id,
                                 "status": persisted["status"],
                                 "lines": [line.rstrip("\n\r") for line in tail_lines],
+                                "start_offset": start_offset,
                             },
                         )
                     else:
