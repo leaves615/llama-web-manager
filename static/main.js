@@ -868,6 +868,28 @@ data() {
   `
 };
 
+const ConfirmModal = {
+  props: ["title", "message", "confirmText", "cancelText", "isDanger"],
+  emits: ["confirm", "cancel"],
+  template: `
+    <div class="confirm-modal" @click.self="$emit('cancel')">
+      <div class="confirm-modal-card">
+        <div class="confirm-modal-head">
+          <strong>{{ title }}</strong>
+          <button type="button" @click="$emit('cancel')">✕</button>
+        </div>
+        <div class="confirm-modal-body">
+          {{ message }}
+        </div>
+        <div class="confirm-modal-footer">
+          <button type="button" class="secondary" @click="$emit('cancel')">{{ cancelText || '取消' }}</button>
+          <button type="button" :class="[isDanger ? 'danger' : 'primary']" @click="$emit('confirm')">{{ confirmText || '确认' }}</button>
+        </div>
+      </div>
+    </div>
+  `
+};
+
 const LogModal = {
   props: ["logs", "loading"],
   emits: ["close", "loadMore"],
@@ -891,7 +913,8 @@ const app = createApp({
     InstanceList,
     LogViewer,
     InstanceForm,
-    LogModal
+    LogModal,
+    ConfirmModal
   },
   data() {
     return {
@@ -909,7 +932,17 @@ const app = createApp({
       showLogLarge: false,
       logStream: null,
       daemonStream: null,
-      loadingIds: new Set()
+      loadingIds: new Set(),
+      logReconnectDelay: 1000,
+      logStreamInstanceId: null,
+      daemonReconnectDelay: 1000,
+      showConfirm: false,
+      confirmData: {
+        title: "确认操作",
+        message: "",
+        callback: null,
+        isDanger: false
+      }
     };
   },
   computed: {
@@ -934,15 +967,27 @@ const app = createApp({
   },
   methods: {
     initSSE() {
+      if (this.daemonStream) {
+        return;
+      }
       this.daemonStream = new EventSource("/api/daemon/status/stream");
       this.daemonStream.addEventListener("status", (e) => {
         this.daemonStatus = JSON.parse(e.data || "{}");
+        // 收到数据时重置延迟
+        this.daemonReconnectDelay = 1000;
       });
       this.daemonStream.addEventListener("instances", (e) => {
         this.instances = this.sortInstances(JSON.parse(e.data || "{}").items || []);
       });
       this.daemonStream.onerror = () => {
-        setTimeout(() => this.initSSE(), 5000);
+        if (this.daemonStream) {
+          this.daemonStream.close();
+          this.daemonStream = null;
+        }
+        // 指数退避重连：1s → 2s → 4s → ... 最大 30s
+        this.daemonReconnectDelay = (this.daemonReconnectDelay || 1000) * 2;
+        this.daemonReconnectDelay = Math.min(this.daemonReconnectDelay, 30000);
+        setTimeout(() => this.initSSE(), this.daemonReconnectDelay);
       };
     },
     async refreshInstances() {
@@ -982,6 +1027,7 @@ const app = createApp({
       if (this.logStream) {
         this.logStream.close();
       }
+      this.logStreamInstanceId = id;
       this.logLoading = true;
       this.currentLogs = [];
       this.logOffset = 0;
@@ -1003,7 +1049,21 @@ const app = createApp({
       });
       this.logStream.onerror = () => {
         this.logLoading = false;
+        if (this.logStream) {
+          this.logStream.close();
+          this.logStream = null;
+        }
+        // 指数退避重连：1s → 2s → 4s → ... 最大 30s
+        this.logReconnectDelay = (this.logReconnectDelay || 1000) * 2;
+        this.logReconnectDelay = Math.min(this.logReconnectDelay, 30000);
+        setTimeout(() => {
+          if (this.logStreamInstanceId === id) {
+            this.startLogStream(id);
+          }
+        }, this.logReconnectDelay);
       };
+      // 连接成功时重置延迟
+      this.logReconnectDelay = 1000;
     },
     async loadMoreLogs() {
       if (this.logLoadMoreLoading || !this.selectedInstanceId || this.logOffset <= 0) return;
@@ -1030,19 +1090,27 @@ const app = createApp({
       this.showForm = true;
     },
     async deleteInstance(instance) {
-      if (!confirm(`确定要删除实例 "${instance.name}" 吗？此操作不可恢复。`)) return;
-      this.loadingIds.add(instance.instance_id);
-      try {
-        await api.deleteInstance(instance.instance_id);
-        if (this.selectedInstanceId === instance.instance_id) {
-          this.selectedInstanceId = null;
+      this.showConfirm = true;
+      this.confirmData = {
+        title: "删除实例",
+        message: `确定要删除实例 "${instance.name}" 吗？此操作不可恢复。`,
+        isDanger: true,
+        callback: async () => {
+          this.showConfirm = false;
+          this.loadingIds.add(instance.instance_id);
+          try {
+            await api.deleteInstance(instance.instance_id);
+            if (this.selectedInstanceId === instance.instance_id) {
+              this.selectedInstanceId = null;
+            }
+            await this.refreshInstances();
+          } catch (e) {
+            alert(e.message);
+          } finally {
+            this.loadingIds.delete(instance.instance_id);
+          }
         }
-        await this.refreshInstances();
-      } catch (e) {
-        alert(e.message);
-      } finally {
-        this.loadingIds.delete(instance.instance_id);
-      }
+      };
     },
   async saveForm(payload) {
       this.formLoading = true;
@@ -1082,10 +1150,20 @@ const app = createApp({
         this.logStream.close();
         this.logStream = null;
       }
+      this.logStreamInstanceId = null;
       if (this.daemonStream) {
         this.daemonStream.close();
         this.daemonStream = null;
       }
+    },
+    onConfirm() {
+      if (this.confirmData.callback) {
+        this.confirmData.callback();
+      }
+      this.showConfirm = false;
+    },
+    onCancel() {
+      this.showConfirm = false;
     }
   }
 });

@@ -176,7 +176,14 @@ class LlamaInstance:
         if self._stopped_by_manager:
             return "stopped"
         if self.process:
-            return "running" if self.process.poll() is None else f"exited({self.process.returncode})"
+            try:
+                return "running" if self.process.poll() is None else f"exited({self.process.returncode})"
+            except AttributeError:
+                # process is a psutil.Process object, not subprocess.Popen
+                try:
+                    return "running" if self.process.is_running() else "exited"
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    return "exited"
         return "stopped"
 
     def start(self):
@@ -254,13 +261,18 @@ class LlamaInstance:
                     f.write(msg + "\n")
                     f.flush()
 
-                return_code = self.process.poll()
-                if return_code is None:
-                    try:
-                        return_code = self.process.wait(timeout=1)
-                    except subprocess.TimeoutExpired:
-                        return_code = -1
-                        self.process.kill()
+                return_code = None
+                try:
+                    return_code = self.process.poll()
+                    if return_code is None:
+                        try:
+                            return_code = self.process.wait(timeout=1)
+                        except subprocess.TimeoutExpired:
+                            return_code = -1
+                            self.process.kill()
+                except AttributeError as e:
+                    daemon_logger.error(f"Error polling process: {e}, process type: {type(self.process)}")
+                    return_code = -999
 
                 ended = f"[{now_iso()}] process exited with code {return_code}"
                 f.write(ended + "\n")
@@ -644,16 +656,23 @@ class DaemonManager:
 
     def check_status(self):
         to_remove = []
-        for instance_id, instance in self.instances.items():
-            if instance.status == "stopped":
-                self._db_execute(
-                    "UPDATE instances SET status = 'stopped', pid = NULL, updated_at = ? WHERE instance_id = ?",
-                    (now_iso(), instance_id),
-                )
+        for instance_id, instance in list(self.instances.items()):
+            try:
+                if instance.status == "stopped":
+                    self._db_execute(
+                        "UPDATE instances SET status = 'stopped', pid = NULL, updated_at = ? WHERE instance_id = ?",
+                        (now_iso(), instance_id),
+                    )
+                    to_remove.append(instance_id)
+            except Exception as e:
+                daemon_logger.error(f"Error checking status for instance {instance_id}: {e}")
                 to_remove.append(instance_id)
 
         for instance_id in to_remove:
-            del self.instances[instance_id]
+            try:
+                del self.instances[instance_id]
+            except KeyError:
+                pass
 
         cursor = self._db_execute("SELECT instance_id, pid FROM instances WHERE status = 'running'")
         rows = cursor.fetchall()
@@ -677,6 +696,8 @@ class DaemonManager:
                     (now_iso(), instance_id),
                 )
                 daemon_logger.warning(f"Instance {instance_id} process not found")
+            except Exception as e:
+                daemon_logger.error(f"Error checking process {instance_id} (pid={pid}): {e}")
 
     def run(self):
         def do_shutdown():
@@ -689,10 +710,17 @@ class DaemonManager:
 
         self._start_control_server()
         daemon_logger.info("Starting daemon...")
-        self.scan_existing()
-        self.load_instances()
+        try:
+            self.scan_existing()
+        except Exception as e:
+            daemon_logger.error(f"Error during scan_existing: {e}")
+        
+        try:
+            self.load_instances()
+        except Exception as e:
+            daemon_logger.error(f"Error during load_instances: {e}")
 
-        daemon_logger.info("Daemon running")
+        daemon_logger.info("Daemon running, press Ctrl+C to stop")
 
         while self._running:
             try:
@@ -702,7 +730,7 @@ class DaemonManager:
                 daemon_logger.info("Received interrupt signal")
                 break
             except Exception as e:
-                daemon_logger.error(f"Error: {e}")
+                daemon_logger.error(f"Error in daemon loop: {type(e).__name__}: {e}", exc_info=False)
 
             if self._running:
                 time.sleep(1)

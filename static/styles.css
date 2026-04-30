@@ -257,6 +257,112 @@ h1, h2 {
   padding: 6px 12px;
 }
 
+.confirm-modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(16, 23, 34, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  z-index: 999;
+}
+
+.confirm-modal-card {
+  width: 100%;
+  max-width: 420px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  box-shadow: 0 14px 40px rgba(16, 23, 34, 0.24);
+}
+
+.confirm-modal-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.confirm-modal-head button {
+  width: auto;
+  padding: 6px 12px;
+  background: none;
+  border: none;
+  font-size: 20px;
+  cursor: pointer;
+  color: var(--muted);
+}
+
+.confirm-modal-head button:hover {
+  color: var(--ink);
+}
+
+.confirm-modal-body {
+  padding: 18px;
+  flex-grow: 1;
+  min-height: 60px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  line-height: 1.5;
+  color: var(--ink);
+}
+
+.confirm-modal-footer {
+  display: flex;
+  gap: 12px;
+  padding: 14px 18px;
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+  justify-content: flex-end;
+}
+
+.confirm-modal-footer button {
+  padding: 8px 16px;
+  border: none;
+  border-radius: 6px;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.confirm-modal-footer .primary {
+  background: var(--accent);
+  color: white;
+}
+
+.confirm-modal-footer .primary:hover {
+  background: #0a6a72;
+  box-shadow: 0 4px 12px rgba(14, 124, 134, 0.24);
+}
+
+.confirm-modal-footer .danger {
+  background: var(--danger);
+  color: white;
+}
+
+.confirm-modal-footer .danger:hover {
+  background: #8f3228;
+  box-shadow: 0 4px 12px rgba(179, 60, 47, 0.24);
+}
+
+.confirm-modal-footer .secondary {
+  background: var(--bg);
+  color: var(--ink);
+}
+
+.confirm-modal-footer .secondary:hover {
+  background: #dde4f0;
+}
+
 .form-modal {
   position: fixed;
   inset: 0;

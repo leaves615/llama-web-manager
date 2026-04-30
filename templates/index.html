@@ -67,6 +67,17 @@
         ></instance-form>
       </div>
 
+      <confirm-modal
+        v-if="showConfirm"
+        :title="confirmData.title"
+        :message="confirmData.message"
+        :is-danger="confirmData.isDanger"
+        confirm-text="删除"
+        cancel-text="取消"
+        @confirm="onConfirm"
+        @cancel="onCancel"
+      ></confirm-modal>
+
       <log-modal
         v-if="showLogLarge"
         :logs="currentLogs"

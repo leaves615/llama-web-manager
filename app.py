@@ -250,28 +250,38 @@ class InstanceManager:
         with self._db_lock:
             with self._db_conn() as conn:
                 conn.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS instances (
-                        instance_id TEXT PRIMARY KEY,
-                        name TEXT NOT NULL,
-                        executable_path TEXT NOT NULL,
-                        command_json TEXT NOT NULL,
-                        visual_args_json TEXT NOT NULL,
-                        freeform_args TEXT NOT NULL,
-                        env_vars_json TEXT NOT NULL,
-                        log_file TEXT NOT NULL,
-                        pid INTEGER,
-                        status TEXT NOT NULL,
-                        command TEXT,
-                        created_at TEXT NOT NULL,
-                        updated_at TEXT NOT NULL
-                    )
-                    """
+                    "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY)"
                 )
-                try:
-                    conn.execute("ALTER TABLE instances ADD COLUMN env_vars_json TEXT DEFAULT '[]'")
-                except sqlite3.OperationalError:
-                    pass
+                row = conn.execute("SELECT version FROM schema_version ORDER BY version DESC").fetchone()
+                current_version = row["version"] if row else 0
+                if current_version < 1:
+                    conn.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS instances (
+                            instance_id TEXT PRIMARY KEY,
+                            name TEXT NOT NULL,
+                            executable_path TEXT NOT NULL,
+                            command_json TEXT NOT NULL,
+                            visual_args_json TEXT NOT NULL,
+                            freeform_args TEXT NOT NULL,
+                            env_vars_json TEXT NOT NULL DEFAULT '[]',
+                            log_file TEXT NOT NULL,
+                            pid INTEGER,
+                            status TEXT NOT NULL,
+                            command TEXT,
+                            created_at TEXT NOT NULL,
+                            updated_at TEXT NOT NULL
+                        )
+                        """
+                    )
+                    conn.execute("INSERT OR REPLACE INTO schema_version (version) VALUES (1)")
+                    current_version = 1
+                if current_version < 2:
+                    try:
+                        conn.execute("ALTER TABLE instances ADD COLUMN command TEXT")
+                    except sqlite3.OperationalError:
+                        pass
+                    conn.execute("INSERT OR REPLACE INTO schema_version (version) VALUES (2)")
 
     def _upsert_instance(
         self,
@@ -295,7 +305,7 @@ class InstanceManager:
                     """
                     INSERT INTO instances (
                         instance_id, name, executable_path, command_json, visual_args_json,
-                        freeform_args, env_vars_json, log_file, pid, status, created_at, updated_at
+                        freeform_args, env_vars_json, log_file, pid, status, command, created_at, updated_at
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(instance_id) DO UPDATE SET
                         name=excluded.name,
@@ -307,6 +317,7 @@ class InstanceManager:
                         log_file=excluded.log_file,
                         pid=excluded.pid,
                         status=excluded.status,
+                        command=excluded.command,
                         updated_at=excluded.updated_at
                     """,
                     (
@@ -706,6 +717,30 @@ class InstanceManager:
             "name": persisted["name"],
             "status": "stopping",
             "pid": persisted.get("pid"),
+        }
+
+    def delete_instance(self, instance_id: str) -> Dict:
+        persisted = self._get_persisted_instance(instance_id)
+        if not persisted:
+            raise ValueError("实例不存在")
+
+        # Delete from database
+        with self._db_lock:
+            with self._db_conn() as conn:
+                conn.execute("DELETE FROM instances WHERE instance_id = ?", (instance_id,))
+
+        # Delete log file
+        log_file = Path(persisted["log_file"])
+        if log_file.exists():
+            try:
+                log_file.unlink()
+            except Exception:
+                pass
+
+        return {
+            "instance_id": instance_id,
+            "name": persisted["name"],
+            "status": "deleted",
         }
 
     def _capture_output(self, record: InstanceRecord) -> None:
@@ -1191,6 +1226,15 @@ def update_instance(instance_id: str):
             env_vars=body.get("env_vars", []),
         )
         return jsonify(updated)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/instances/<instance_id>", methods=["DELETE"])
+def delete_instance(instance_id: str):
+    try:
+        result = manager.delete_instance(instance_id)
+        return jsonify(result)
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
