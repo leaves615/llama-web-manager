@@ -93,7 +93,7 @@ const DaemonPanel = {
 
 const InstanceList = {
   props: ["instances", "selectedId", "loadingIds"],
-  emits: ["select", "edit", "toggle", "copy"],
+  emits: ["select", "edit", "toggle", "copy", "delete"],
   computed: {
     firstRunning() {
       return this.instances.find(i => String(i.status).startsWith("running"));
@@ -122,6 +122,7 @@ const InstanceList = {
           <button class="view-log" @click.stop="$emit('select', item.instance_id, item.name)">查看日志</button>
           <button class="copy" @click.stop="$emit('copy', item)">复制配置</button>
           <button class="edit" @click.stop="$emit('edit', item)">编辑</button>
+          <button class="danger" @click.stop="$emit('delete', item)">删除</button>
           <button
             :class="['toggle', 'loading-effect', isRunning(item.status) ? 'danger' : 'primary', { loading: isLoading(item.instance_id) }]"
             :disabled="isLoading(item.instance_id)"
@@ -144,7 +145,8 @@ const LogViewer = {
       lastScrollHeight: 0,
       lastScrollTop: 0,
       loadingMore: false,
-      _stack: []
+      _stack: [],
+      maxLines: 1000
     };
   },
   computed: {
@@ -220,20 +222,33 @@ const LogViewer = {
          return 'rgb(' + gray + ',' + gray + ',' + gray + ')';
        }
      },
-    updateContent() {
-        if (this.$refs.output) {
-          const emptyMsg = this.emptyText || "请选择左侧实例以查看日志...";
-          if (this.logs.length === 0) {
-            this.$refs.output.innerHTML = emptyMsg;
-          } else {
-            var html = '';
-            for (var i = 0; i < this.logs.length; i++) {
-              html += '<div class="log-line">' + this.parseAndHighlight(this.logs[i]) + '</div>';
-            }
-            this.$refs.output.innerHTML = html;
-          }
-        }
-      },
+updateContent() {
+         if (!this.$refs.output) return;
+         const emptyMsg = this.emptyText || "请选择左侧实例以查看日志...";
+         if (this.logs.length === 0) {
+           this.$refs.output.innerHTML = emptyMsg;
+           return;
+         }
+         const currentLineCount = this.$refs.output.querySelectorAll('.log-line').length;
+         if (this.logs.length === 0) {
+           this.$refs.output.innerHTML = emptyMsg;
+         } else if (currentLineCount === 0) {
+           var html = '';
+           for (var i = 0; i < this.logs.length; i++) {
+             html += '<div class="log-line">' + this.parseAndHighlight(this.logs[i]) + '</div>';
+           }
+           this.$refs.output.innerHTML = html;
+         } else if (this.logs.length > currentLineCount) {
+           var frag = document.createDocumentFragment();
+           for (var i = currentLineCount; i < this.logs.length; i++) {
+             var lineDiv = document.createElement('div');
+             lineDiv.className = 'log-line';
+             lineDiv.innerHTML = this.parseAndHighlight(this.logs[i]);
+             frag.appendChild(lineDiv);
+           }
+           this.$refs.output.appendChild(frag);
+         }
+       },
      parseAndHighlight(text) {
        var hiMap = this.buildSyntaxHighlightMap(text);
        var segments = [];
@@ -981,6 +996,9 @@ const app = createApp({
         const data = JSON.parse(e.data || "{}");
         if (data.line) {
           this.currentLogs.push(data.line);
+          if (this.autoScroll && this.currentLogs.length > 1000) {
+            this.currentLogs = this.currentLogs.slice(-1000);
+          }
         }
       });
       this.logStream.onerror = () => {
@@ -1010,6 +1028,21 @@ const app = createApp({
       const { instance_id, pid, status, name, ...rest } = instance;
       this.editingInstance = { ...rest, name: name + " (副本)" };
       this.showForm = true;
+    },
+    async deleteInstance(instance) {
+      if (!confirm(`确定要删除实例 "${instance.name}" 吗？此操作不可恢复。`)) return;
+      this.loadingIds.add(instance.instance_id);
+      try {
+        await api.deleteInstance(instance.instance_id);
+        if (this.selectedInstanceId === instance.instance_id) {
+          this.selectedInstanceId = null;
+        }
+        await this.refreshInstances();
+      } catch (e) {
+        alert(e.message);
+      } finally {
+        this.loadingIds.delete(instance.instance_id);
+      }
     },
   async saveForm(payload) {
       this.formLoading = true;

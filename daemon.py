@@ -119,8 +119,7 @@ def kill_process_tree(pid: int, include_parent: bool = True) -> bool:
 
 
 def now_iso():
-    """返回本地时间的 ISO 格式字符串（毫秒精度，无时区信息）"""
-    return dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
+    return dt.datetime.now().astimezone().isoformat()
 
 
 def load_config() -> Dict:

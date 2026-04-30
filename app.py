@@ -100,7 +100,7 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def utc_now_iso() -> str:
-    return dt.datetime.now(dt.timezone.utc).isoformat()
+    return dt.datetime.now().astimezone().isoformat()
 
 
 def load_runtime_config() -> Dict:
