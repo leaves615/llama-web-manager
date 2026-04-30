@@ -595,7 +595,13 @@ class DaemonManager:
                 instance.stop()
                 del self.instances[instance_id]
             else:
-                return None
+                # 实例存在但非running状态（如exited、stopped等），清理后重新创建
+                daemon_logger.info(f"Instance {instance.name} is {instance.status}, cleaning up and restarting...")
+                try:
+                    instance.stop()
+                except Exception as e:
+                    daemon_logger.warning(f"Error stopping exited instance {instance_id}: {e}")
+                del self.instances[instance_id]
 
         try:
             command = json.loads(row["command_json"])
@@ -690,12 +696,18 @@ class DaemonManager:
                         (now_iso(), instance_id),
                     )
                     daemon_logger.warning(f"Instance {instance_id} process exited (status: {status})")
+                    # 清理内存中的已退出实例对象，避免重启时卡住
+                    if instance_id in self.instances:
+                        del self.instances[instance_id]
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 self._db_execute(
                     "UPDATE instances SET status = 'exited', pid = NULL, updated_at = ? WHERE instance_id = ?",
                     (now_iso(), instance_id),
                 )
                 daemon_logger.warning(f"Instance {instance_id} process not found")
+                # 清理内存中的已退出实例对象，避免重启时卡住
+                if instance_id in self.instances:
+                    del self.instances[instance_id]
             except Exception as e:
                 daemon_logger.error(f"Error checking process {instance_id} (pid={pid}): {e}")
 
