@@ -362,26 +362,27 @@ h2 {
   position: relative;
   display: flex;
   flex-direction: column;
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  background:
+    linear-gradient(180deg, rgba(5, 10, 18, 0.82), rgba(5, 10, 18, 0.62)),
+    radial-gradient(circle at 10% 0%, rgba(126, 231, 255, 0.18), transparent 35%),
+    radial-gradient(circle at 100% 0%, rgba(115, 123, 255, 0.12), transparent 30%);
+  padding: 14px;
+  border: 1px solid rgba(212, 242, 255, 0.14);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.08),
+    inset 0 -1px 0 rgba(126, 231, 255, 0.03),
+    0 0 0 1px rgba(126, 231, 255, 0.04);
 }
 
 .log-output,
 .log-output-large {
   flex: 1;
   min-height: 0;
-  background:
-    linear-gradient(180deg, rgba(5, 10, 18, 0.82), rgba(5, 10, 18, 0.62)),
-    radial-gradient(circle at 10% 0%, rgba(126, 231, 255, 0.18), transparent 35%),
-    radial-gradient(circle at 100% 0%, rgba(115, 123, 255, 0.12), transparent 30%);
   color: #d8e4f0;
-  border-radius: var(--radius-lg);
-  padding: 14px;
   margin: 0;
-  overflow: auto;
-  border: 1px solid rgba(212, 242, 255, 0.14);
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.08),
-    inset 0 -1px 0 rgba(126, 231, 255, 0.03),
-    0 0 0 1px rgba(126, 231, 255, 0.04);
+  overflow-y: auto;
   font-family: "SF Mono", "Consolas", "Menlo", monospace;
   font-size: 12px;
   line-height: 1.55;
@@ -390,9 +391,6 @@ h2 {
 }
 
 .log-output.log-output-large {
-  border-radius: 0;
-  border-left: 0;
-  border-right: 0;
 }
 
 .log-line {
@@ -403,7 +401,7 @@ h2 {
 .scroll-latest-btn {
   position: absolute;
   bottom: 16px;
-  right: 16px;
+  right: 32px;
   width: 36px;
   height: 36px;
   display: flex;
