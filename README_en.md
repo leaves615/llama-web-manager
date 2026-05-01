@@ -5,6 +5,10 @@
 
 A lightweight web management tool for launching and managing multiple `llama-server` instances.
 
+## Screenshot
+
+![Llama Manager UI Screenshot](img/snapshot1.png)
+
 ## Features
 
 - Launch and manage multiple `llama-server` instances

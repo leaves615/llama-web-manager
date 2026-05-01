@@ -799,6 +799,21 @@ textarea::placeholder {
   color: rgba(214, 228, 242, 0.46);
 }
 
+/* Footer styles */
+.site-footer {
+  font-size: 13px;
+  color: var(--muted);
+  margin-top: 12px;
+}
+.site-footer a {
+  color: var(--accent-strong);
+  text-decoration: none;
+}
+.site-footer a:hover {
+  color: var(--accent);
+  text-decoration: underline;
+}
+
 input:focus,
 select:focus,
 textarea:focus {

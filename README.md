@@ -5,6 +5,10 @@
 
 一个简洁的 Web 管理工具，用于启动和管理多个 `llama-server` 实例。
 
+## 界面截图
+
+![Llama Manager 界面截图](img/snapshot1.png)
+
 ## 功能特性
 
 - 启动和管理多个 `llama-server` 实例
