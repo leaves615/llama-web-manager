@@ -53,7 +53,9 @@
           <log-viewer
             :logs="currentLogs"
             :loading="logLoading"
-            @loadMore="loadMoreLogs"
+            :instance-id="selectedInstanceId"
+            :start-offset="logOffset"
+            @history-loaded="onHistoryLoaded"
           ></log-viewer>
         </section>
       </main>
@@ -82,7 +84,9 @@
         v-if="showLogLarge"
         :logs="currentLogs"
         :loading="logLoading"
-        @loadMore="loadMoreLogs"
+        :instance-id="selectedInstanceId"
+        :start-offset="logOffset"
+        @history-loaded="onHistoryLoaded"
         @close="showLogLarge = false"
       ></log-modal>
     </div>

@@ -137,8 +137,8 @@ const InstanceList = {
 };
 
 const LogViewer = {
-  props: ["logs", "loading", "cssClass", "emptyText"],
-  emits: ["loadMore"],
+  props: ["logs", "loading", "cssClass", "emptyText", "instanceId", "startOffset"],
+  emits: ["historyLoaded"],
   data() {
     return {
       autoScroll: true,
@@ -146,7 +146,8 @@ const LogViewer = {
       lastScrollTop: 0,
       loadingMore: false,
       _stack: [],
-      maxLines: 1000
+      maxLines: 1000,
+      localOffset: 0
     };
   },
   computed: {
@@ -158,6 +159,13 @@ const LogViewer = {
     }
   },
   watch: {
+    startOffset: {
+      immediate: true,
+      handler(val) {
+        const nextOffset = Number(val);
+        this.localOffset = Number.isFinite(nextOffset) && nextOffset >= 0 ? nextOffset : 0;
+      }
+    },
     logs: {
       handler() {
         this.updateContent();
@@ -222,33 +230,25 @@ const LogViewer = {
          return 'rgb(' + gray + ',' + gray + ',' + gray + ')';
        }
      },
-updateContent() {
-         if (!this.$refs.output) return;
-         const emptyMsg = this.emptyText || "请选择左侧实例以查看日志...";
-         if (this.logs.length === 0) {
-           this.$refs.output.innerHTML = emptyMsg;
-           return;
-         }
-         const currentLineCount = this.$refs.output.querySelectorAll('.log-line').length;
-         if (this.logs.length === 0) {
-           this.$refs.output.innerHTML = emptyMsg;
-         } else if (currentLineCount === 0) {
-           var html = '';
-           for (var i = 0; i < this.logs.length; i++) {
-             html += '<div class="log-line">' + this.parseAndHighlight(this.logs[i]) + '</div>';
-           }
-           this.$refs.output.innerHTML = html;
-         } else if (this.logs.length > currentLineCount) {
-           var frag = document.createDocumentFragment();
-           for (var i = currentLineCount; i < this.logs.length; i++) {
-             var lineDiv = document.createElement('div');
-             lineDiv.className = 'log-line';
-             lineDiv.innerHTML = this.parseAndHighlight(this.logs[i]);
-             frag.appendChild(lineDiv);
-           }
-           this.$refs.output.appendChild(frag);
-         }
-       },
+    updateContent() {
+      if (!this.$refs.output) return;
+      const emptyMsg = this.emptyText || "请选择左侧实例以查看日志...";
+      const sourceLogs = Array.isArray(this.logs) ? this.logs : [];
+      if (sourceLogs.length === 0) {
+        this.$refs.output.innerHTML = emptyMsg;
+        return;
+      }
+
+      const visibleLogs = this.autoScroll && sourceLogs.length > this.maxLines
+        ? sourceLogs.slice(-this.maxLines)
+        : sourceLogs;
+
+      let html = '';
+      for (let i = 0; i < visibleLogs.length; i++) {
+        html += '<div class="log-line">' + this.parseAndHighlight(visibleLogs[i]) + '</div>';
+      }
+      this.$refs.output.innerHTML = html;
+    },
      parseAndHighlight(text) {
        var hiMap = this.buildSyntaxHighlightMap(text);
        var segments = [];
@@ -457,6 +457,33 @@ updateContent() {
         this.lastScrollHeight = el.scrollHeight;
       }
     },
+    async loadMore() {
+      const el = this.$refs.output;
+      if (!el || this.loadingMore || this.loading || !this.instanceId || this.localOffset <= 0) {
+        return;
+      }
+
+      this.loadingMore = true;
+      this.lastScrollTop = el.scrollTop;
+      this.lastScrollHeight = el.scrollHeight;
+
+      try {
+        const data = await api.getLogsBefore(this.instanceId, this.localOffset, 200);
+        const lines = Array.isArray(data.lines) ? data.lines : [];
+        if (lines.length > 0) {
+          const nextOffset = Number.isFinite(data.start_offset) ? data.start_offset : Math.max(0, this.localOffset - lines.length);
+          this.localOffset = nextOffset;
+          this.$emit("historyLoaded", {
+            lines,
+            offset: nextOffset
+          });
+        }
+      } catch (e) {
+        console.error(e);
+      } finally {
+        this.loadingMore = false;
+      }
+    },
     onScroll() {
       const el = this.$refs.output;
       if (!el) return;
@@ -466,8 +493,7 @@ updateContent() {
       const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight <= 50;
       this.autoScroll = atBottom;
       if (previousScrollTop > el.scrollTop && el.scrollTop <= 10 && !this.loadingMore && !this.loading) {
-        this.loadingMore = true;
-        this.$emit("loadMore");
+        this.loadMore();
       }
     }
   },
@@ -891,8 +917,8 @@ const ConfirmModal = {
 };
 
 const LogModal = {
-  props: ["logs", "loading"],
-  emits: ["close", "loadMore"],
+  props: ["logs", "loading", "instanceId", "startOffset"],
+  emits: ["close", "historyLoaded"],
   components: { LogViewer },
   template: `
     <div class="log-modal" @click.self="$emit('close')">
@@ -901,7 +927,15 @@ const LogModal = {
           <strong>日志放大查看</strong>
           <button type="button" @click="$emit('close')">✕</button>
         </div>
-        <log-viewer :logs="logs" :loading="loading" :cssClass="'log-output-large'" :emptyText="'暂无日志'" @loadMore="$emit('loadMore')"></log-viewer>
+        <log-viewer
+          :logs="logs"
+          :loading="loading"
+          :instance-id="instanceId"
+          :start-offset="startOffset"
+          :cssClass="'log-output-large'"
+          :emptyText="'暂无日志'"
+          @history-loaded="$emit('historyLoaded', $event)"
+        ></log-viewer>
       </div>
     </div>
   `
@@ -922,7 +956,6 @@ const app = createApp({
       selectedInstanceId: null,
       currentLogs: [],
       logLoading: false,
-      logLoadMoreLoading: false,
       logOffset: 0,
       daemonStatus: { running: false, pid: null },
       daemonLoading: false,
@@ -1065,20 +1098,12 @@ const app = createApp({
       // 连接成功时重置延迟
       this.logReconnectDelay = 1000;
     },
-    async loadMoreLogs() {
-      if (this.logLoadMoreLoading || !this.selectedInstanceId || this.logOffset <= 0) return;
-      this.logLoadMoreLoading = true;
-      try {
-        const data = await api.getLogsBefore(this.selectedInstanceId, this.logOffset, 200);
-        if (data.lines && data.lines.length > 0) {
-          this.currentLogs = [...data.lines, ...this.currentLogs];
-          this.logOffset = Math.max(0, this.logOffset - data.lines.length);
-        }
-      } catch (e) {
-        console.error(e);
-      } finally {
-        this.logLoadMoreLoading = false;
-      }
+    onHistoryLoaded(payload) {
+      const lines = Array.isArray(payload?.lines) ? payload.lines : [];
+      if (lines.length === 0) return;
+      this.currentLogs = [...lines, ...this.currentLogs];
+      const nextOffset = Number.isFinite(payload?.offset) ? payload.offset : Math.max(0, this.logOffset - lines.length);
+      this.logOffset = nextOffset;
     },
     openForm(instance) {
       this.editingInstance = instance;
