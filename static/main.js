@@ -141,13 +141,18 @@ const LogViewer = {
   emits: ["historyLoaded"],
   data() {
     return {
+      // component-local state
+      displayLogs: [],
+      liveTail: [],
+      historyOffset: 0,
       autoScroll: true,
       lastScrollHeight: 0,
       lastScrollTop: 0,
       loadingMore: false,
       _stack: [],
       maxLines: 1000,
-      localOffset: 0
+      eventSource: null,
+      logLoading: false
     };
   },
   computed: {
@@ -159,27 +164,31 @@ const LogViewer = {
     }
   },
   watch: {
-    startOffset: {
+    instanceId: {
       immediate: true,
-      handler(val) {
-        const nextOffset = Number(val);
-        this.localOffset = Number.isFinite(nextOffset) && nextOffset >= 0 ? nextOffset : 0;
+      handler(id) {
+        // restart stream when instance changes
+        this.stopStream();
+        if (id) {
+          this.displayLogs = [];
+          this.historyOffset = Number.isFinite(Number(this.startOffset)) ? Number(this.startOffset) : 0;
+          this.startStream(id);
+        }
       }
     },
     logs: {
-      handler() {
-        this.updateContent();
-        this.$nextTick(() => {
-          if (this.autoScroll) {
-            this.scrollToBottom();
-          } else {
-            this.keepScrollPosition();
-          }
-        });
-        this.loadingMore = false;
+      handler(newVal) {
+        // fallback: if parent provides logs (back-compat), use them only when no instanceId
+        if (!this.instanceId) {
+          this.displayLogs = Array.isArray(newVal) ? newVal.slice() : [];
+          this.updateContent();
+        }
       },
       deep: true
     }
+  },
+  beforeUnmount() {
+    this.stopStream();
   },
   mounted() {
     this.updateContent();
@@ -188,6 +197,49 @@ const LogViewer = {
     });
   },
   methods: {
+    startStream(id) {
+      if (!id) return;
+      this.stopStream();
+      this.eventSource = new EventSource(`/api/instances/${id}/logs/stream?lines=300`);
+      this.logLoading = true;
+      this.eventSource.addEventListener('snapshot', (e) => {
+        this.logLoading = false;
+        const data = JSON.parse(e.data || "{}");
+        this.displayLogs = (data.lines || []).slice();
+        this.historyOffset = Number.isFinite(data.start_offset) ? data.start_offset : Math.max(0, this.displayLogs.length);
+        this.updateContent();
+        this.$nextTick(() => this.scrollToBottom());
+      });
+      this.eventSource.addEventListener('append', (e) => {
+        const data = JSON.parse(e.data || "{}");
+        if (data.line) {
+          this.displayLogs.push(data.line);
+          if (this.autoScroll && this.displayLogs.length > this.maxLines) {
+            this.displayLogs = this.displayLogs.slice(-this.maxLines);
+          }
+          this.updateContent();
+          if (this.autoScroll) this.$nextTick(() => this.scrollToBottom());
+        }
+      });
+      this.eventSource.onerror = () => {
+        this.logLoading = false;
+        if (this.eventSource) {
+          this.eventSource.close();
+          this.eventSource = null;
+        }
+        // reconnect with backoff
+        setTimeout(() => {
+          if (this.instanceId === id) this.startStream(id);
+        }, 1000);
+      };
+    },
+    stopStream() {
+      if (this.eventSource) {
+        try { this.eventSource.close(); } catch (e) {}
+        this.eventSource = null;
+      }
+      this.logLoading = false;
+    },
      getColorMap() {
        return {
          '0': '', '1': 'font-weight:bold', '2': 'opacity:.5', '3': 'font-style:italic',
@@ -233,7 +285,7 @@ const LogViewer = {
     updateContent() {
       if (!this.$refs.output) return;
       const emptyMsg = this.emptyText || "请选择左侧实例以查看日志...";
-      const sourceLogs = Array.isArray(this.logs) ? this.logs : [];
+      const sourceLogs = Array.isArray(this.displayLogs) ? this.displayLogs : [];
       if (sourceLogs.length === 0) {
         this.$refs.output.innerHTML = emptyMsg;
         return;
@@ -459,24 +511,31 @@ const LogViewer = {
     },
     async loadMore() {
       const el = this.$refs.output;
-      if (!el || this.loadingMore || this.loading || !this.instanceId || this.localOffset <= 0) {
-        return;
-      }
-
+      if (!el || this.loadingMore || this.logLoading || !this.instanceId || this.historyOffset <= 0) return;
+      // user is loading history: disable autoScroll so prepended lines are visible
+      this.autoScroll = false;
       this.loadingMore = true;
       this.lastScrollTop = el.scrollTop;
       this.lastScrollHeight = el.scrollHeight;
-
       try {
-        const data = await api.getLogsBefore(this.instanceId, this.localOffset, 200);
+        const data = await api.getLogsBefore(this.instanceId, this.historyOffset, 200);
         const lines = Array.isArray(data.lines) ? data.lines : [];
         if (lines.length > 0) {
-          const nextOffset = Number.isFinite(data.start_offset) ? data.start_offset : Math.max(0, this.localOffset - lines.length);
-          this.localOffset = nextOffset;
-          this.$emit("historyLoaded", {
-            lines,
-            offset: nextOffset
+          // prepend into displayLogs and update historyOffset
+          this.displayLogs = [...lines, ...this.displayLogs];
+          // ensure content reflects new displayLogs before measuring
+          this.updateContent();
+          this.historyOffset = Number.isFinite(data.start_offset) ? data.start_offset : Math.max(0, this.historyOffset - lines.length);
+          // maintain scroll position after prepend
+          this.$nextTick(() => {
+            const newHeight = el.scrollHeight;
+            el.scrollTop = newHeight - this.lastScrollHeight + this.lastScrollTop;
+            this.lastScrollHeight = newHeight;
           });
+        }
+        else {
+          // no more history
+          this.historyOffset = 0;
         }
       } catch (e) {
         console.error(e);
@@ -487,12 +546,12 @@ const LogViewer = {
     onScroll() {
       const el = this.$refs.output;
       if (!el) return;
-      const previousScrollTop = this.lastScrollTop;
       this.lastScrollTop = el.scrollTop;
       this.lastScrollHeight = el.scrollHeight;
       const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight <= 50;
       this.autoScroll = atBottom;
-      if (previousScrollTop > el.scrollTop && el.scrollTop <= 10 && !this.loadingMore && !this.loading) {
+      // If user scrolled near the top, load more history.
+      if (el.scrollTop <= 10 && !this.loadingMore && !this.loading) {
         this.loadMore();
       }
     }
@@ -1054,57 +1113,10 @@ const app = createApp({
     },
     selectInstance(id, name) {
       this.selectedInstanceId = id;
-      this.startLogStream(id);
+      // LogViewer now manages its own SSE and history; just set the selected id.
     },
-  startLogStream(id) {
-      if (this.logStream) {
-        this.logStream.close();
-      }
-      this.logStreamInstanceId = id;
-      this.logLoading = true;
-      this.currentLogs = [];
-      this.logOffset = 0;
-      this.logStream = new EventSource(`/api/instances/${id}/logs/stream?lines=300`);
-      this.logStream.addEventListener("snapshot", (e) => {
-        this.logLoading = false;
-        const data = JSON.parse(e.data || "{}");
-        this.currentLogs = data.lines || [];
-        this.logOffset = Number.isFinite(data.start_offset) ? data.start_offset : Math.max(0, this.currentLogs.length);
-      });
-      this.logStream.addEventListener("append", (e) => {
-        const data = JSON.parse(e.data || "{}");
-        if (data.line) {
-          this.currentLogs.push(data.line);
-          if (this.autoScroll && this.currentLogs.length > 1000) {
-            this.currentLogs = this.currentLogs.slice(-1000);
-          }
-        }
-      });
-      this.logStream.onerror = () => {
-        this.logLoading = false;
-        if (this.logStream) {
-          this.logStream.close();
-          this.logStream = null;
-        }
-        // 指数退避重连：1s → 2s → 4s → ... 最大 30s
-        this.logReconnectDelay = (this.logReconnectDelay || 1000) * 2;
-        this.logReconnectDelay = Math.min(this.logReconnectDelay, 30000);
-        setTimeout(() => {
-          if (this.logStreamInstanceId === id) {
-            this.startLogStream(id);
-          }
-        }, this.logReconnectDelay);
-      };
-      // 连接成功时重置延迟
-      this.logReconnectDelay = 1000;
-    },
-    onHistoryLoaded(payload) {
-      const lines = Array.isArray(payload?.lines) ? payload.lines : [];
-      if (lines.length === 0) return;
-      this.currentLogs = [...lines, ...this.currentLogs];
-      const nextOffset = Number.isFinite(payload?.offset) ? payload.offset : Math.max(0, this.logOffset - lines.length);
-      this.logOffset = nextOffset;
-    },
+    // startLogStream removed: LogViewer handles SSE internally
+    // onHistoryLoaded removed: LogViewer handles history loading and display internally
     openForm(instance) {
       this.editingInstance = instance;
       this.showForm = true;
