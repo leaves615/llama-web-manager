@@ -81,41 +81,63 @@ def setup_logging():
 daemon_logger = setup_logging()
 
 
+def _safe_terminate(proc: psutil.Process) -> bool:
+    """安全地终止进程，返回是否成功"""
+    try:
+        proc.terminate()
+        return True
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return False
+
+
+def _safe_kill(proc: psutil.Process) -> bool:
+    """安全地杀死进程，返回是否成功"""
+    try:
+        proc.kill()
+        return True
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return False
+
+
 def kill_process_tree(pid: int, include_parent: bool = True) -> bool:
-    """跨平台终止进程树"""
+    """跨平台终止进程树，返回是否成功"""
     try:
         parent = psutil.Process(pid)
-        children = parent.children(recursive=True)
-    except psutil.NoSuchProcess:
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
         return True
 
+    # 终止所有子进程
+    try:
+        children = parent.children(recursive=True)
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        children = []
+
     for child in children:
-        try:
-            child.terminate()
-        except psutil.NoSuchProcess:
-            pass
+        _safe_terminate(child)
 
     gone, alive = psutil.wait_procs(children, timeout=3)
     for p in alive:
-        try:
-            p.kill()
-        except psutil.NoSuchProcess:
-            pass
+        _safe_kill(p)
 
+    # 终止父进程
     if include_parent:
         try:
             parent.terminate()
-            parent.wait(timeout=3)
-        except psutil.TimeoutExpired:
             try:
-                parent.kill()
                 parent.wait(timeout=3)
-            except psutil.NoSuchProcess:
-                pass
-        except psutil.NoSuchProcess:
+            except psutil.TimeoutExpired:
+                _safe_kill(parent)
+                try:
+                    parent.wait(timeout=3)
+                except (psutil.TimeoutExpired, psutil.NoSuchProcess):
+                    pass
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
 
-    return parent.is_running() == False
+    try:
+        return not parent.is_running()
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return True
 
 
 def now_iso():
@@ -213,36 +235,38 @@ class LlamaInstance:
         self._start_log_capture()
         daemon_logger.info(f"Started instance {self.name} (PID: {self.pid})")
 
-    def stop(self):
+    def stop(self) -> bool:
         self._stopped_by_manager = True
         pid = self.pid
         daemon_logger.info(f"Stopping instance {self.name} (PID: {pid})...")
         if pid == 0:
             daemon_logger.warning(f"Instance {self.name} has no PID")
-            return
+            return False
 
         success = kill_process_tree(pid, include_parent=True)
         if not success:
             try:
                 parent = psutil.Process(pid)
                 if parent.is_running():
-                    daemon_logger.warning(f"Process still alive, trying SIGKILL...")
-                    if os.name == "nt":
-                        subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], check=False)
-                    else:
-                        os.kill(pid, signal.SIGKILL)
+                    daemon_logger.warning(f"Process still alive after kill_process_tree, trying direct SIGKILL...")
+                    _safe_kill(parent)
+                    try:
+                        parent.wait(timeout=2)
+                    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.TimeoutExpired):
+                        pass
             except psutil.NoSuchProcess:
-                pass
+                return True
 
+        # 最终验证
         try:
-            parent_check = psutil.Process(pid)
-            if parent_check.is_running():
+            if psutil.Process(pid).is_running():
                 daemon_logger.warning(f"Instance {self.name} (PID: {pid}) may still be running")
-            else:
-                daemon_logger.info(f"Instance {self.name} (PID: {pid}) stopped successfully")
-        except psutil.NoSuchProcess:
-            daemon_logger.info(f"Instance {self.name} (PID: {pid}) stopped successfully")
+                return False
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+
         daemon_logger.info(f"Stopped instance {self.name}")
+        return True
 
     def _start_log_capture(self):
         def capture():
@@ -462,14 +486,21 @@ class DaemonManager:
             return {"success": False, "error": "instance_id required"}
 
         instance = self.instances.get(instance_id)
-        if instance:
-            instance.stop()
-            del self.instances[instance_id]
 
+        # 1. 先更新 DB（确保状态可回查，即使 kill 失败也有记录）
         self._db_execute(
             "UPDATE instances SET status = 'stopped', pid = NULL WHERE instance_id = ?",
             (instance_id,)
         )
+
+        # 2. 再尝试 kill 进程
+        if instance:
+            try:
+                instance.stop()
+            except Exception as e:
+                daemon_logger.error(f"Failed to stop instance {instance_id}: {e}")
+
+            del self.instances[instance_id]
 
         return {"success": True, "instance": self._serialize_instance(instance_id)}
 
