@@ -7,6 +7,7 @@ import signal
 import socket
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -30,20 +31,55 @@ def _get_daemon_info() -> Optional[tuple]:
             lines = f.read().strip().split("\n")
         if len(lines) < 2:
             return None
-        return int(lines[0]), int(lines[1])
-    except:
+        pid = int(lines[0])
+        port = int(lines[1])
+        return pid, port
+    except Exception:
         return None
 
 
 def _is_daemon_running() -> bool:
-    """检查 daemon 是否运行"""
+    """检查 daemon 是否运行（结合PID和TCP端口验证）"""
     info = _get_daemon_info()
     if not info:
         return False
+    
+    pid, port = info
+    
+    # 检查PID对应的进程是否存在
     try:
-        proc = psutil.Process(info[0])
-        return proc.is_running()
+        proc = psutil.Process(pid)
+        if not proc.is_running():
+            try:
+                DAEMON_PID_FILE.unlink()
+            except:
+                pass
+            return False
     except psutil.NoSuchProcess:
+        try:
+            DAEMON_PID_FILE.unlink()
+        except:
+            pass
+        return False
+    
+    # 验证TCP端口连通性
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(1)
+        result = sock.connect_ex(("127.0.0.1", port))
+        sock.close()
+        if result == 0:
+            return True
+        try:
+            DAEMON_PID_FILE.unlink()
+        except:
+            pass
+        return False
+    except Exception:
+        try:
+            DAEMON_PID_FILE.unlink()
+        except:
+            pass
         return False
 
 
@@ -76,10 +112,43 @@ def _control_request(request: Dict, timeout: float = 10) -> Optional[Dict]:
 
 
 def stop_daemon_via_tcp() -> bool:
-    """通过 TCP 连接停止 daemon"""
+    """通过 TCP 连接停止 daemon，并等待其真正退出"""
     response = _control_request({"action": "stop", "target": "daemon"}, timeout=10)
     if response and response.get("success"):
-        return True
+        if _wait_for_daemon_stopped(timeout=10):
+            return True
+    return False
+
+
+def _start_daemon_process() -> None:
+    daemon_path = APP_ROOT / "daemon.py"
+    creationflags = 0
+    if os.name == "nt":
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+    subprocess.Popen(
+        [sys.executable, str(daemon_path)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=creationflags,
+        start_new_session=True,
+    )
+
+
+def _wait_for_daemon_ready(timeout: float = 10.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _is_daemon_running():
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def _wait_for_daemon_stopped(timeout: float = 10.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _is_daemon_running():
+            return True
+        time.sleep(0.5)
     return False
 from flask import Flask, Response, jsonify, render_template, request, stream_with_context
 import yaml
@@ -345,6 +414,15 @@ class InstanceManager:
                 )
 
     def _list_persisted_instances(self) -> List[Dict]:
+        # 首先检查 daemon 是否还在运行，如果不运行则清理所有running状态的实例
+        if not _is_daemon_running():
+            with self._db_lock:
+                with self._db_conn() as conn:
+                    conn.execute(
+                        "UPDATE instances SET status = 'exited', pid = NULL, updated_at = ? WHERE status = 'running'",
+                        (utc_now_iso(),),
+                    )
+        
         with self._db_lock:
             with self._db_conn() as conn:
                 rows = conn.execute(
@@ -353,13 +431,40 @@ class InstanceManager:
 
         items: List[Dict] = []
         for row in rows:
+            # 验证进程状态：如果数据库显示running但进程不存在，则更新为exited
+            status = row["status"]
+            pid = row["pid"]
+            instance_id = row["instance_id"]
+            
+            if status == "running" and pid:
+                try:
+                    proc = psutil.Process(pid)
+                    if not proc.is_running():
+                        # 进程已结束，更新数据库
+                        with self._db_lock:
+                            with self._db_conn() as conn:
+                                conn.execute(
+                                    "UPDATE instances SET status = 'exited', pid = NULL, updated_at = ? WHERE instance_id = ?",
+                                    (utc_now_iso(), instance_id),
+                                )
+                        status = "exited"
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    # 进程不存在，更新数据库
+                    with self._db_lock:
+                        with self._db_conn() as conn:
+                            conn.execute(
+                                "UPDATE instances SET status = 'exited', pid = NULL, updated_at = ? WHERE instance_id = ?",
+                                (utc_now_iso(), instance_id),
+                            )
+                    status = "exited"
+            
             items.append(
                 {
                     "instance_id": row["instance_id"],
                     "name": row["name"],
                     "executable_path": row["executable_path"],
                     "pid": row["pid"],
-                    "status": row["status"],
+                    "status": status,
                     "created_at": row["created_at"],
                     "command": json.loads(row["command_json"]),
                     "log_file": row["log_file"],
@@ -634,36 +739,6 @@ class InstanceManager:
             "env_vars": env_vars,
         }
 
-    def start_instance(self, instance_id: str) -> Dict:
-        persisted = self._get_persisted_instance(instance_id)
-        if not persisted:
-            raise ValueError("实例不存在")
-
-        command = self._build_command(
-            server_dir=persisted["executable_path"],
-            visual_args=persisted["visual_args"],
-            freeform_args=persisted["freeform_args"],
-        )
-
-        self._db_execute(
-            "UPDATE instances SET command_json = ?, command = 'start', updated_at = ? WHERE instance_id = ?",
-            (json.dumps(command, ensure_ascii=False), utc_now_iso(), instance_id),
-        )
-
-        return {
-            "instance_id": instance_id,
-            "name": persisted["name"],
-            "executable_path": persisted["executable_path"],
-            "command": command,
-            "pid": persisted.get("pid"),
-            "status": "starting",
-            "created_at": persisted["created_at"],
-            "log_file": persisted["log_file"],
-            "visual_args": persisted["visual_args"],
-            "freeform_args": persisted["freeform_args"],
-            "env_vars": persisted.get("env_vars", []),
-        }
-
     def update_instance(
         self,
         instance_id: str,
@@ -684,7 +759,7 @@ class InstanceManager:
         log_file = persisted["log_file"]
 
         self._db_execute(
-            "UPDATE instances SET name = ?, executable_path = ?, command_json = ?, visual_args_json = ?, freeform_args = ?, env_vars_json = ?, command = 'start', updated_at = ? WHERE instance_id = ?",
+            "UPDATE instances SET name = ?, executable_path = ?, command_json = ?, visual_args_json = ?, freeform_args = ?, env_vars_json = ?, updated_at = ? WHERE instance_id = ?",
             (name, server_dir, json.dumps(command, ensure_ascii=False), json.dumps(visual_args, ensure_ascii=False), freeform_args, json.dumps(env_vars, ensure_ascii=False), utc_now_iso(), instance_id),
         )
 
@@ -694,29 +769,12 @@ class InstanceManager:
             "executable_path": server_dir,
             "command": command,
             "pid": persisted.get("pid"),
-            "status": "restarting",
+            "status": "updated",
             "created_at": persisted["created_at"],
             "log_file": log_file,
             "visual_args": visual_args,
             "freeform_args": freeform_args,
             "env_vars": env_vars,
-        }
-
-    def stop_instance(self, instance_id: str) -> Dict:
-        persisted = self._get_persisted_instance(instance_id)
-        if not persisted:
-            raise ValueError("实例不存在")
-
-        self._db_execute(
-            "UPDATE instances SET command = 'stop', updated_at = ? WHERE instance_id = ?",
-            (utc_now_iso(), instance_id),
-        )
-
-        return {
-            "instance_id": instance_id,
-            "name": persisted["name"],
-            "status": "stopping",
-            "pid": persisted.get("pid"),
         }
 
     def delete_instance(self, instance_id: str) -> Dict:
@@ -1033,30 +1091,12 @@ DAEMON_PROCESS_NAME = "daemon.py"
 
 
 def _ensure_daemon_running():
-    current_pid = os.getpid()
-    for proc in psutil.process_iter(["pid", "name", "cmdline"]):
-        try:
-            if proc.info["pid"] == current_pid:
-                continue
-            cmdline = proc.info.get("cmdline") or []
-            if any("daemon.py" in str(arg) for arg in cmdline):
-                return
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
+    if _is_daemon_running():
+        return
 
-    print("[App] Daemon not running, starting...")
-    daemon_path = APP_ROOT / "daemon.py"
-    creationflags = 0
-    if os.name == "nt":
-        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
-    subprocess.Popen(
-        ["python", str(daemon_path)],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        creationflags=creationflags,
-        start_new_session=True,
-    )
-    time.sleep(2)
+    _start_daemon_process()
+    if _wait_for_daemon_ready(timeout=10):
+        return
 
 
 _ensure_daemon_running()
@@ -1073,19 +1113,9 @@ def index():
 
 @app.get("/api/daemon/status")
 def daemon_status():
-    import psutil
-
-    current_pid = os.getpid()
-    for proc in psutil.process_iter(["pid", "name", "cmdline"]):
-        try:
-            if proc.info["pid"] == current_pid:
-                continue
-            cmdline = proc.info.get("cmdline") or []
-            if any("daemon.py" in str(arg) for arg in cmdline):
-                return jsonify({"running": True, "pid": proc.info["pid"]})
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
-    return jsonify({"running": False, "pid": None})
+    running = _is_daemon_running()
+    info = _get_daemon_info() if running else None
+    return jsonify({"running": running, "pid": info[0] if info else None})
 
 
 @app.get("/api/daemon/status/stream")
@@ -1095,22 +1125,9 @@ def daemon_status_stream():
         last_instance_status = None
         while True:
             try:
-                import psutil
-
-                current_pid = os.getpid()
-                running = False
-                pid = None
-                for proc in psutil.process_iter(["pid", "name", "cmdline"]):
-                    try:
-                        if proc.info["pid"] == current_pid:
-                            continue
-                        cmdline = proc.info.get("cmdline") or []
-                        if any("daemon.py" in str(arg) for arg in cmdline):
-                            running = True
-                            pid = proc.info["pid"]
-                            break
-                    except (psutil.NoSuchProcess, psutil.AccessDenied):
-                        continue
+                running = _is_daemon_running()
+                info = _get_daemon_info() if running else None
+                pid = info[0] if info else None
 
                 status = {"running": running, "pid": pid}
                 if status != last_status:
@@ -1138,31 +1155,12 @@ def daemon_status_stream():
 
 @app.post("/api/daemon/start")
 def daemon_start():
-    import psutil
+    if _is_daemon_running():
+        return jsonify({"error": "守护进程已在运行"}), 400
 
-    current_pid = os.getpid()
-    for proc in psutil.process_iter(["pid", "name", "cmdline"]):
-        try:
-            if proc.info["pid"] == current_pid:
-                continue
-            cmdline = proc.info.get("cmdline") or []
-            if any("daemon.py" in str(arg) for arg in cmdline):
-                return jsonify({"error": "守护进程已在运行"}), 400
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
-
-    daemon_path = APP_ROOT / "daemon.py"
-    creationflags = 0
-    if os.name == "nt":
-        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
-    subprocess.Popen(
-        ["python", str(daemon_path)],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        creationflags=creationflags,
-        start_new_session=True,
-    )
-    time.sleep(2)
+    _start_daemon_process()
+    if not _wait_for_daemon_ready(timeout=10):
+        return jsonify({"error": "守护进程启动失败"}), 500
     return jsonify({"success": True})
 
 
@@ -1170,7 +1168,9 @@ def daemon_start():
 def daemon_stop():
     if stop_daemon_via_tcp():
         return jsonify({"success": True})
-    return jsonify({"error": "守护进程未运行"}), 400
+    if not _is_daemon_running():
+        return jsonify({"error": "守护进程未运行"}), 400
+    return jsonify({"error": "守护进程停止超时"}), 504
 
 
 @app.get("/api/instances")
@@ -1225,6 +1225,15 @@ def update_instance(instance_id: str):
             freeform_args=body.get("freeform_args", ""),
             env_vars=body.get("env_vars", []),
         )
+        # 通过 TCP 停止旧进程并启动新进程（重启）
+        _control_request({"action": "stop", "target": "instance", "instance_id": instance_id})
+        start_resp = _control_request({
+            "action": "start", "target": "instance", "instance_id": instance_id
+        })
+        if start_resp and start_resp.get("success"):
+            inst = start_resp.get("instance", {})
+            updated["status"] = inst.get("status", updated.get("status"))
+            updated["pid"] = inst.get("pid")
         return jsonify(updated)
     except Exception as e:
         return jsonify({"error": str(e)}), 400
@@ -1233,6 +1242,8 @@ def update_instance(instance_id: str):
 @app.route("/api/instances/<instance_id>", methods=["DELETE"])
 def delete_instance(instance_id: str):
     try:
+        # 先通过 TCP 停止进程（best effort）
+        _control_request({"action": "stop", "target": "instance", "instance_id": instance_id})
         result = manager.delete_instance(instance_id)
         return jsonify(result)
     except Exception as e:

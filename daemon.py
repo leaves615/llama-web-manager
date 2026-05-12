@@ -464,7 +464,7 @@ class DaemonManager:
         return result
 
     def _do_start_instance(self, instance_id: str) -> Dict:
-        """启动单个实例"""
+        """启动单个实例（通过 TCP 请求触发）"""
         if not instance_id:
             return {"success": False, "error": "instance_id required"}
 
@@ -472,35 +472,98 @@ class DaemonManager:
         if not row:
             return {"success": False, "error": "instance not found"}
 
+        # 内存级防护：已在运行则跳过
         if instance_id in self.instances:
             inst = self.instances[instance_id]
             if inst.status == "running":
                 return {"success": True, "instance": self._serialize_instance(instance_id, inst)}
+            # 存在但非 running，清理后重启
+            daemon_logger.info(f"Instance {inst.name} is {inst.status}, stopping and restarting...")
+            try:
+                inst.stop()
+            except Exception as e:
+                daemon_logger.warning(f"Error stopping exited instance {instance_id}: {e}")
+            del self.instances[instance_id]
 
-        instance = self._start_instance_from_row(row)
-        return {"success": True, "instance": self._serialize_instance(instance_id, instance)}
+        # DB 级防护：避免并发 TCP 请求重复启动
+        db_inst = self._get_persisted_instance(instance_id)
+        if db_inst and db_inst.get("status") == "running" and instance_id in self.instances:
+            daemon_logger.info(f"Instance {db_inst['name']} already running, skipping")
+            return {"success": True, "instance": self._serialize_instance(instance_id, self.instances[instance_id])}
+
+        try:
+            command = json.loads(row["command_json"])
+            log_file = Path(row["log_file"])
+
+            instance = LlamaInstance(
+                instance_id=instance_id,
+                name=row["name"],
+                executable_path=row["executable_path"],
+                command=command,
+                log_file=log_file,
+                visual_args=json.loads(row["visual_args_json"]),
+                freeform_args=row["freeform_args"],
+                env_vars=json.loads(row.get("env_vars_json") or "[]"),
+                created_at=row["created_at"],
+            )
+
+            instance.start()
+            self.instances[instance_id] = instance
+
+            self._db_execute(
+                "UPDATE instances SET pid = ?, status = 'running', updated_at = ? WHERE instance_id = ?",
+                (instance.pid, now_iso(), instance_id),
+            )
+            daemon_logger.info(f"Started {instance.name}")
+            return {"success": True, "instance": self._serialize_instance(instance_id, instance)}
+        except Exception as e:
+            daemon_logger.error(f"Failed to start {instance_id}: {e}")
+            self._db_execute(
+                "UPDATE instances SET status = 'error', updated_at = ? WHERE instance_id = ?",
+                (now_iso(), instance_id),
+            )
+            return {"success": False, "error": str(e)}
 
     def _do_stop_instance(self, instance_id: str) -> Dict:
         """停止单个实例"""
         if not instance_id:
             return {"success": False, "error": "instance_id required"}
 
+        # 先检查 DB 状态，避免对已停止的实例做无用操作
+        db_row = self._get_persisted_instance(instance_id)
+        if db_row and db_row.get("status") != "running":
+            return {"success": True, "instance": self._serialize_instance(instance_id)}
+
         instance = self.instances.get(instance_id)
 
-        # 1. 先更新 DB（确保状态可回查，即使 kill 失败也有记录）
-        self._db_execute(
-            "UPDATE instances SET status = 'stopped', pid = NULL WHERE instance_id = ?",
-            (instance_id,)
-        )
-
-        # 2. 再尝试 kill 进程
+        # 1. 先尝试 kill 进程（内存中或根据 PID）
         if instance:
             try:
                 instance.stop()
             except Exception as e:
                 daemon_logger.error(f"Failed to stop instance {instance_id}: {e}")
+            finally:
+                del self.instances[instance_id]
+        elif db_row and db_row.get("pid"):
+            # 实例不在内存中，但 DB 显示 running — 尝试根据 PID 终止
+            pid = db_row["pid"]
+            daemon_logger.info(f"Instance {db_row['name']} not in memory, killing PID {pid} directly")
+            try:
+                proc = psutil.Process(pid)
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except psutil.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=3)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
 
-            del self.instances[instance_id]
+        # 2. 成功后再更新 DB
+        self._db_execute(
+            "UPDATE instances SET status = 'stopped', pid = NULL, updated_at = ? WHERE instance_id = ?",
+            (now_iso(), instance_id),
+        )
 
         return {"success": True, "instance": self._serialize_instance(instance_id)}
 
@@ -601,96 +664,6 @@ class DaemonManager:
             except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
                 daemon_logger.error(f"Failed to restore {row['instance_id']}: {e}")
 
-    def process_commands(self):
-        cursor = self._db_execute("SELECT * FROM instances WHERE command = 'start'")
-        rows = cursor.fetchall()
-        if rows:
-            daemon_logger.info(f"Processing {len(rows)} start command(s)")
-        for row in rows:
-            self._start_instance_from_row(row)
-
-        cursor = self._db_execute("SELECT * FROM instances WHERE command = 'stop'")
-        rows = cursor.fetchall()
-        if rows:
-            daemon_logger.info(f"Processing {len(rows)} stop command(s)")
-        for row in rows:
-            self._stop_instance(row)
-
-    def _start_instance_from_row(self, row: Dict) -> Optional["LlamaInstance"]:
-        """从数据库行启动实例，返回启动的实例或None"""
-        instance_id = row["instance_id"]
-        if instance_id in self.instances:
-            instance = self.instances[instance_id]
-            if instance.status == "running":
-                daemon_logger.info(f"Instance {instance.name} already running, stopping and restarting...")
-                instance.stop()
-                del self.instances[instance_id]
-            else:
-                # 实例存在但非running状态（如exited、stopped等），清理后重新创建
-                daemon_logger.info(f"Instance {instance.name} is {instance.status}, cleaning up and restarting...")
-                try:
-                    instance.stop()
-                except Exception as e:
-                    daemon_logger.warning(f"Error stopping exited instance {instance_id}: {e}")
-                del self.instances[instance_id]
-
-        try:
-            command = json.loads(row["command_json"])
-            log_file = Path(row["log_file"])
-
-            instance = LlamaInstance(
-                instance_id=instance_id,
-                name=row["name"],
-                executable_path=row["executable_path"],
-                command=command,
-                log_file=log_file,
-                visual_args=json.loads(row["visual_args_json"]),
-                freeform_args=row["freeform_args"],
-                env_vars=json.loads(row.get("env_vars_json") or "[]"),
-                created_at=row["created_at"],
-            )
-            instance.start()
-
-            self.instances[instance_id] = instance
-
-            self._db_execute(
-                "UPDATE instances SET pid = ?, status = 'running', command = NULL, updated_at = ? WHERE instance_id = ?",
-                (instance.pid, now_iso(), instance_id),
-            )
-            daemon_logger.info(f"Started {instance.name}")
-            return instance
-        except Exception as e:
-            daemon_logger.error(f"Failed to start {instance_id}: {e}")
-            self._db_execute(
-                "UPDATE instances SET status = 'error', command = NULL, updated_at = ? WHERE instance_id = ?",
-                (now_iso(), instance_id),
-            )
-            return None
-
-    def process_commands(self):
-        """处理数据库命令（兼容旧方案）"""
-        cursor = self._db_execute("SELECT * FROM instances WHERE command = 'start'")
-        rows = cursor.fetchall()
-        if rows:
-            daemon_logger.info(f"Processing {len(rows)} start command(s)")
-        for row in rows:
-            self._start_instance_from_row(dict(row))
-
-        cursor = self._db_execute("SELECT * FROM instances WHERE command = 'stop'")
-        rows = cursor.fetchall()
-        if rows:
-            daemon_logger.info(f"Processing {len(rows)} stop command(s)")
-        for row in rows:
-            instance_id = dict(row)["instance_id"]
-            instance = self.instances.get(instance_id)
-            if instance:
-                instance.stop()
-                del self.instances[instance_id]
-            self._db_execute(
-                "UPDATE instances SET pid = NULL, status = 'stopped', command = NULL, updated_at = ? WHERE instance_id = ?",
-                (now_iso(), instance_id),
-            )
-
     def check_status(self):
         to_remove = []
         for instance_id, instance in list(self.instances.items()):
@@ -767,7 +740,6 @@ class DaemonManager:
 
         while self._running:
             try:
-                self.process_commands()
                 self.check_status()
             except KeyboardInterrupt:
                 daemon_logger.info("Received interrupt signal")

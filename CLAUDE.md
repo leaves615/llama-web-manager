@@ -43,3 +43,8 @@ python app.py                      # 启动 Flask，自动创建守护进程
 - 前端使用 `main.js` 内联模板（非 SFC）。
 - 日志查看器支持 ANSI 颜色渲染和历史日志加载（`/logs/before?offset=&limit=`）。
 - 守护进程通过扫描 `config.yaml` 配置的目录自动发现 llama-server 版本。
+
+## 重要约束
+
+- 方案始终使用中文，不允许英文。
+- 对话始终使用中文。
