@@ -22,6 +22,14 @@ APP_ROOT = Path(__file__).parent
 DAEMON_PID_FILE = APP_ROOT / "daemon.pid"
 
 
+def _write_daemon_info(pid: int, port: int) -> None:
+    """写入 daemon PID 和端口，便于后续快速探测。"""
+    try:
+        DAEMON_PID_FILE.write_text(f"{pid}\n{port}\n", encoding="utf-8")
+    except Exception:
+        pass
+
+
 def _get_daemon_info() -> Optional[tuple]:
     """读取 daemon PID 和端口"""
     if not DAEMON_PID_FILE.exists():
@@ -38,9 +46,62 @@ def _get_daemon_info() -> Optional[tuple]:
         return None
 
 
+def _discover_daemon_info_from_processes() -> Optional[tuple]:
+    """在 pid 文件丢失或失效时，通过进程和监听端口反查 daemon。"""
+    for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+        try:
+            cmdline = " ".join(proc.info.get("cmdline") or [])
+            name = proc.info.get("name") or ""
+            if "daemon.py" not in cmdline and "daemon.py" not in name:
+                continue
+
+            connections = proc.net_connections(kind="inet")
+            listening_ports = []
+            for conn in connections:
+                if conn.status != psutil.CONN_LISTEN:
+                    continue
+                if conn.laddr and getattr(conn.laddr, "port", None):
+                    listening_ports.append(conn.laddr.port)
+
+            if not listening_ports:
+                continue
+
+            port = listening_ports[0]
+            pid = proc.pid
+            _write_daemon_info(pid, port)
+            return pid, port
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            continue
+        except Exception:
+            continue
+
+    return None
+
+
+def _resolve_daemon_info() -> Optional[tuple]:
+    """优先使用 pid 文件；失败时回退到进程扫描。"""
+    info = _get_daemon_info()
+    if info:
+        pid, port = info
+        try:
+            proc = psutil.Process(pid)
+            if proc.is_running():
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(1)
+                try:
+                    if sock.connect_ex(("127.0.0.1", port)) == 0:
+                        return pid, port
+                finally:
+                    sock.close()
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            pass
+
+    return _discover_daemon_info_from_processes()
+
+
 def _is_daemon_running() -> bool:
     """检查 daemon 是否运行（结合PID和TCP端口验证）"""
-    info = _get_daemon_info()
+    info = _resolve_daemon_info()
     if not info:
         return False
     
@@ -85,7 +146,7 @@ def _is_daemon_running() -> bool:
 
 def _control_request(request: Dict, timeout: float = 10) -> Optional[Dict]:
     """向 daemon 发送 TCP 控制请求"""
-    info = _get_daemon_info()
+    info = _resolve_daemon_info()
     if not info:
         return None
 
@@ -413,6 +474,47 @@ class InstanceManager:
                     (pid, status, utc_now_iso(), instance_id),
                 )
 
+    def _matches_expected_command(self, proc: psutil.Process, expected_command: List[str]) -> bool:
+        if not expected_command:
+            return True
+        try:
+            actual_command = proc.cmdline()
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            return False
+        if len(actual_command) < len(expected_command):
+            return False
+        return actual_command[: len(expected_command)] == expected_command
+
+    def _probe_instance_row(self, row: Dict) -> tuple[str, Optional[int]]:
+        # Convert sqlite3.Row to dict for .get() compatibility
+        if not isinstance(row, dict):
+            row = dict(row)
+        
+        status = row["status"]
+        pid = row["pid"]
+
+        if status != "running":
+            return status, pid
+
+        if not pid:
+            self._update_instance_status(row["instance_id"], None, "exited")
+            return "exited", None
+
+        expected_command = json.loads(row.get("command_json", "") or "") if row.get("command_json") else []
+        try:
+            proc = psutil.Process(pid)
+            if not proc.is_running():
+                raise psutil.NoSuchProcess(pid)
+            proc_status = proc.status()
+            if proc_status in (psutil.STATUS_ZOMBIE, psutil.STATUS_DEAD):
+                raise psutil.NoSuchProcess(pid)
+            if not self._matches_expected_command(proc, expected_command):
+                raise psutil.NoSuchProcess(pid)
+            return "running", pid
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            self._update_instance_status(row["instance_id"], None, "exited")
+            return "exited", None
+
     def _list_persisted_instances(self) -> List[Dict]:
         # 首先检查 daemon 是否还在运行，如果不运行则清理所有running状态的实例
         if not _is_daemon_running():
@@ -431,32 +533,7 @@ class InstanceManager:
 
         items: List[Dict] = []
         for row in rows:
-            # 验证进程状态：如果数据库显示running但进程不存在，则更新为exited
-            status = row["status"]
-            pid = row["pid"]
-            instance_id = row["instance_id"]
-            
-            if status == "running" and pid:
-                try:
-                    proc = psutil.Process(pid)
-                    if not proc.is_running():
-                        # 进程已结束，更新数据库
-                        with self._db_lock:
-                            with self._db_conn() as conn:
-                                conn.execute(
-                                    "UPDATE instances SET status = 'exited', pid = NULL, updated_at = ? WHERE instance_id = ?",
-                                    (utc_now_iso(), instance_id),
-                                )
-                        status = "exited"
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    # 进程不存在，更新数据库
-                    with self._db_lock:
-                        with self._db_conn() as conn:
-                            conn.execute(
-                                "UPDATE instances SET status = 'exited', pid = NULL, updated_at = ? WHERE instance_id = ?",
-                                (utc_now_iso(), instance_id),
-                            )
-                    status = "exited"
+            status, pid = self._probe_instance_row(row)
             
             items.append(
                 {

@@ -440,6 +440,60 @@ class DaemonManager:
         row = cursor.fetchone()
         return dict(row) if row else None
 
+    def _matches_expected_command(self, proc: psutil.Process, expected_command: List[str]) -> bool:
+        if not expected_command:
+            return True
+        try:
+            actual_command = proc.cmdline()
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            return False
+        if len(actual_command) < len(expected_command):
+            return False
+        return actual_command[: len(expected_command)] == expected_command
+
+    def _probe_persisted_instance(self, row: Dict, instance: Optional["LlamaInstance"] = None) -> tuple[str, Optional[int]]:
+        # Convert sqlite3.Row to dict for .get() compatibility
+        if not isinstance(row, dict):
+            row = dict(row)
+        
+        status = row["status"]
+        pid = row["pid"]
+
+        if instance and instance.process:
+            try:
+                if instance.status == "running":
+                    return "running", instance.pid
+            except Exception:
+                pass
+
+        if status != "running":
+            return status, pid
+
+        if not pid:
+            self._db_execute(
+                "UPDATE instances SET status = 'exited', pid = NULL, updated_at = ? WHERE instance_id = ?",
+                (now_iso(), row["instance_id"]),
+            )
+            return "exited", None
+
+        expected_command = json.loads(row.get("command_json", "") or "") if row.get("command_json") else []
+        try:
+            proc = psutil.Process(pid)
+            if not proc.is_running():
+                raise psutil.NoSuchProcess(pid)
+            proc_status = proc.status()
+            if proc_status in (psutil.STATUS_ZOMBIE, psutil.STATUS_DEAD):
+                raise psutil.NoSuchProcess(pid)
+            if not self._matches_expected_command(proc, expected_command):
+                raise psutil.NoSuchProcess(pid)
+            return "running", pid
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            self._db_execute(
+                "UPDATE instances SET status = 'exited', pid = NULL, updated_at = ? WHERE instance_id = ?",
+                (now_iso(), row["instance_id"]),
+            )
+            return "exited", None
+
     def _serialize_instance(self, instance_id: str, instance: Optional["LlamaInstance"] = None) -> Dict:
         row = self._get_persisted_instance(instance_id)
         if not row:
@@ -458,8 +512,9 @@ class DaemonManager:
             "log_file": str(row["log_file"]),
         }
 
-        if instance:
-            result["status"] = instance.status
+        status, pid = self._probe_persisted_instance(row, instance)
+        result["status"] = status
+        result["pid"] = pid
 
         return result
 
