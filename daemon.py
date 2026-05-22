@@ -215,6 +215,15 @@ class LlamaInstance:
 
         env = os.environ.copy()
         for item in self.env_vars:
+            enabled_raw = item.get("enabled", True)
+            enabled = enabled_raw if isinstance(enabled_raw, bool) else str(enabled_raw).strip().lower() not in {
+                "0",
+                "false",
+                "off",
+                "no",
+            }
+            if not enabled:
+                continue
             key = (item.get("key") or "").strip()
             value = (item.get("value") or "").strip()
             if key:

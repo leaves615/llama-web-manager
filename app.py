@@ -14,20 +14,14 @@ import uuid
 from collections import deque
 from pathlib import Path
 from typing import Dict, List, Optional
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 import psutil
 
 
 APP_ROOT = Path(__file__).parent
 DAEMON_PID_FILE = APP_ROOT / "daemon.pid"
-
-
-def _write_daemon_info(pid: int, port: int) -> None:
-    """写入 daemon PID 和端口，便于后续快速探测。"""
-    try:
-        DAEMON_PID_FILE.write_text(f"{pid}\n{port}\n", encoding="utf-8")
-    except Exception:
-        pass
 
 
 def _get_daemon_info() -> Optional[tuple]:
@@ -46,62 +40,9 @@ def _get_daemon_info() -> Optional[tuple]:
         return None
 
 
-def _discover_daemon_info_from_processes() -> Optional[tuple]:
-    """在 pid 文件丢失或失效时，通过进程和监听端口反查 daemon。"""
-    for proc in psutil.process_iter(["pid", "name", "cmdline"]):
-        try:
-            cmdline = " ".join(proc.info.get("cmdline") or [])
-            name = proc.info.get("name") or ""
-            if "daemon.py" not in cmdline and "daemon.py" not in name:
-                continue
-
-            connections = proc.net_connections(kind="inet")
-            listening_ports = []
-            for conn in connections:
-                if conn.status != psutil.CONN_LISTEN:
-                    continue
-                if conn.laddr and getattr(conn.laddr, "port", None):
-                    listening_ports.append(conn.laddr.port)
-
-            if not listening_ports:
-                continue
-
-            port = listening_ports[0]
-            pid = proc.pid
-            _write_daemon_info(pid, port)
-            return pid, port
-        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
-            continue
-        except Exception:
-            continue
-
-    return None
-
-
-def _resolve_daemon_info() -> Optional[tuple]:
-    """优先使用 pid 文件；失败时回退到进程扫描。"""
-    info = _get_daemon_info()
-    if info:
-        pid, port = info
-        try:
-            proc = psutil.Process(pid)
-            if proc.is_running():
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(1)
-                try:
-                    if sock.connect_ex(("127.0.0.1", port)) == 0:
-                        return pid, port
-                finally:
-                    sock.close()
-        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
-            pass
-
-    return _discover_daemon_info_from_processes()
-
-
 def _is_daemon_running() -> bool:
     """检查 daemon 是否运行（结合PID和TCP端口验证）"""
-    info = _resolve_daemon_info()
+    info = _get_daemon_info()
     if not info:
         return False
     
@@ -146,7 +87,7 @@ def _is_daemon_running() -> bool:
 
 def _control_request(request: Dict, timeout: float = 10) -> Optional[Dict]:
     """向 daemon 发送 TCP 控制请求"""
-    info = _resolve_daemon_info()
+    info = _get_daemon_info()
     if not info:
         return None
 
@@ -241,6 +182,10 @@ def load_runtime_config() -> Dict:
         "model_scan_roots": [],
         "model_scan_max_depth": 5,
         "model_extensions": [".gguf", ".bin"],
+        "param_sync_enabled": False,
+        "param_sync_interval_seconds": 86400,
+        "param_cache_file": ".cache/llama_params.json",
+        "param_readme_url": "https://raw.githubusercontent.com/ggml-org/llama.cpp/master/tools/server/README.md",
     }
     if not CONFIG_FILE.exists():
         return default_cfg
@@ -255,6 +200,13 @@ def load_runtime_config() -> Dict:
         model_roots = raw.get("model_scan_roots", roots)
         model_depth = raw.get("model_scan_max_depth", depth)
         model_exts = raw.get("model_extensions", [".gguf", ".bin"])
+        param_sync_enabled = raw.get("param_sync_enabled", False)
+        param_sync_interval = raw.get("param_sync_interval_seconds", 86400)
+        param_cache_file = raw.get("param_cache_file", ".cache/llama_params.json")
+        param_readme_url = raw.get(
+            "param_readme_url",
+            "https://raw.githubusercontent.com/ggml-org/llama.cpp/master/tools/server/README.md",
+        )
         if not isinstance(roots, list):
             roots = []
         if not isinstance(depth, int) or depth <= 0:
@@ -267,6 +219,12 @@ def load_runtime_config() -> Dict:
             model_depth = depth
         if not isinstance(model_exts, list) or not model_exts:
             model_exts = [".gguf", ".bin"]
+        if not isinstance(param_sync_enabled, bool):
+            param_sync_enabled = str(param_sync_enabled).strip().lower() in {"1", "true", "yes", "on", "enabled"}
+        if not isinstance(param_sync_interval, int) or param_sync_interval <= 0:
+            param_sync_interval = 86400
+        param_cache_file = str(param_cache_file).strip() or ".cache/llama_params.json"
+        param_readme_url = str(param_readme_url).strip() or "https://raw.githubusercontent.com/ggml-org/llama.cpp/master/tools/server/README.md"
 
         normalized_exts = []
         for ext in model_exts:
@@ -284,6 +242,10 @@ def load_runtime_config() -> Dict:
             "model_scan_roots": [str(x).strip() for x in model_roots if str(x).strip()],
             "model_scan_max_depth": model_depth,
             "model_extensions": sorted(set(normalized_exts)),
+            "param_sync_enabled": param_sync_enabled,
+            "param_sync_interval_seconds": param_sync_interval,
+            "param_cache_file": param_cache_file,
+            "param_readme_url": param_readme_url,
         }
     except Exception:
         return default_cfg
@@ -461,6 +423,7 @@ class InstanceManager:
                         str(log_file),
                         pid,
                         status,
+                        json.dumps(command, ensure_ascii=False),
                         created_at,
                         now,
                     ),
@@ -473,47 +436,6 @@ class InstanceManager:
                     "UPDATE instances SET pid = ?, status = ?, updated_at = ? WHERE instance_id = ?",
                     (pid, status, utc_now_iso(), instance_id),
                 )
-
-    def _matches_expected_command(self, proc: psutil.Process, expected_command: List[str]) -> bool:
-        if not expected_command:
-            return True
-        try:
-            actual_command = proc.cmdline()
-        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
-            return False
-        if len(actual_command) < len(expected_command):
-            return False
-        return actual_command[: len(expected_command)] == expected_command
-
-    def _probe_instance_row(self, row: Dict) -> tuple[str, Optional[int]]:
-        # Convert sqlite3.Row to dict for .get() compatibility
-        if not isinstance(row, dict):
-            row = dict(row)
-        
-        status = row["status"]
-        pid = row["pid"]
-
-        if status != "running":
-            return status, pid
-
-        if not pid:
-            self._update_instance_status(row["instance_id"], None, "exited")
-            return "exited", None
-
-        expected_command = json.loads(row.get("command_json", "") or "") if row.get("command_json") else []
-        try:
-            proc = psutil.Process(pid)
-            if not proc.is_running():
-                raise psutil.NoSuchProcess(pid)
-            proc_status = proc.status()
-            if proc_status in (psutil.STATUS_ZOMBIE, psutil.STATUS_DEAD):
-                raise psutil.NoSuchProcess(pid)
-            if not self._matches_expected_command(proc, expected_command):
-                raise psutil.NoSuchProcess(pid)
-            return "running", pid
-        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
-            self._update_instance_status(row["instance_id"], None, "exited")
-            return "exited", None
 
     def _list_persisted_instances(self) -> List[Dict]:
         # 首先检查 daemon 是否还在运行，如果不运行则清理所有running状态的实例
@@ -533,7 +455,32 @@ class InstanceManager:
 
         items: List[Dict] = []
         for row in rows:
-            status, pid = self._probe_instance_row(row)
+            # 验证进程状态：如果数据库显示running但进程不存在，则更新为exited
+            status = row["status"]
+            pid = row["pid"]
+            instance_id = row["instance_id"]
+            
+            if status == "running" and pid:
+                try:
+                    proc = psutil.Process(pid)
+                    if not proc.is_running():
+                        # 进程已结束，更新数据库
+                        with self._db_lock:
+                            with self._db_conn() as conn:
+                                conn.execute(
+                                    "UPDATE instances SET status = 'exited', pid = NULL, updated_at = ? WHERE instance_id = ?",
+                                    (utc_now_iso(), instance_id),
+                                )
+                        status = "exited"
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    # 进程不存在，更新数据库
+                    with self._db_lock:
+                        with self._db_conn() as conn:
+                            conn.execute(
+                                "UPDATE instances SET status = 'exited', pid = NULL, updated_at = ? WHERE instance_id = ?",
+                                (utc_now_iso(), instance_id),
+                            )
+                    status = "exited"
             
             items.append(
                 {
@@ -816,6 +763,36 @@ class InstanceManager:
             "env_vars": env_vars,
         }
 
+    def start_instance(self, instance_id: str) -> Dict:
+        persisted = self._get_persisted_instance(instance_id)
+        if not persisted:
+            raise ValueError("实例不存在")
+
+        command = self._build_command(
+            server_dir=persisted["executable_path"],
+            visual_args=persisted["visual_args"],
+            freeform_args=persisted["freeform_args"],
+        )
+
+        self._db_execute(
+            "UPDATE instances SET command_json = ?, command = 'start', updated_at = ? WHERE instance_id = ?",
+            (json.dumps(command, ensure_ascii=False), utc_now_iso(), instance_id),
+        )
+
+        return {
+            "instance_id": instance_id,
+            "name": persisted["name"],
+            "executable_path": persisted["executable_path"],
+            "command": command,
+            "pid": persisted.get("pid"),
+            "status": "starting",
+            "created_at": persisted["created_at"],
+            "log_file": persisted["log_file"],
+            "visual_args": persisted["visual_args"],
+            "freeform_args": persisted["freeform_args"],
+            "env_vars": persisted.get("env_vars", []),
+        }
+
     def update_instance(
         self,
         instance_id: str,
@@ -836,7 +813,7 @@ class InstanceManager:
         log_file = persisted["log_file"]
 
         self._db_execute(
-            "UPDATE instances SET name = ?, executable_path = ?, command_json = ?, visual_args_json = ?, freeform_args = ?, env_vars_json = ?, updated_at = ? WHERE instance_id = ?",
+            "UPDATE instances SET name = ?, executable_path = ?, command_json = ?, visual_args_json = ?, freeform_args = ?, env_vars_json = ?, command = 'start', updated_at = ? WHERE instance_id = ?",
             (name, server_dir, json.dumps(command, ensure_ascii=False), json.dumps(visual_args, ensure_ascii=False), freeform_args, json.dumps(env_vars, ensure_ascii=False), utc_now_iso(), instance_id),
         )
 
@@ -846,12 +823,29 @@ class InstanceManager:
             "executable_path": server_dir,
             "command": command,
             "pid": persisted.get("pid"),
-            "status": "updated",
+            "status": "restarting",
             "created_at": persisted["created_at"],
             "log_file": log_file,
             "visual_args": visual_args,
             "freeform_args": freeform_args,
             "env_vars": env_vars,
+        }
+
+    def stop_instance(self, instance_id: str) -> Dict:
+        persisted = self._get_persisted_instance(instance_id)
+        if not persisted:
+            raise ValueError("实例不存在")
+
+        self._db_execute(
+            "UPDATE instances SET command = 'stop', updated_at = ? WHERE instance_id = ?",
+            (utc_now_iso(), instance_id),
+        )
+
+        return {
+            "instance_id": instance_id,
+            "name": persisted["name"],
+            "status": "stopping",
+            "pid": persisted.get("pid"),
         }
 
     def delete_instance(self, instance_id: str) -> Dict:
@@ -1112,8 +1106,83 @@ class AutoScanService:
                 [{"name": v["name"], "path": v["path"]} for v in merged.values()],
                 key=lambda item: item["name"].lower(),
             )
+            # 为可能存在的同名模型生成唯一的展示名（display_name）
+            try:
+                self._format_unique_display_names(self._models)
+            except Exception:
+                # 保持容错，若显示名生成失败则不影响原有字段
+                pass
             self._model_error = "" if self._models else "未扫描到模型文件"
             self._model_scanned_at = utc_now_iso()
+
+    def _format_unique_display_names(self, items: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        """
+        给每个模型条目添加 `display_name` 字段以便前端展示。
+        - 默认 `display_name` 为 `name`（文件名）
+        - 若存在同名项，则逐级在前面追加父目录名（最近一级优先），直到在组内唯一或使用完整父路径
+        """
+        if not items:
+            return items
+
+        # 初始化默认 display_name
+        for it in items:
+            it["display_name"] = it.get("name", "")
+
+        # 按小写 name 分组
+        groups: Dict[str, List[int]] = {}
+        for idx, it in enumerate(items):
+            key = (it.get("name") or "").lower()
+            groups.setdefault(key, []).append(idx)
+
+        for key, idxs in groups.items():
+            if len(idxs) <= 1:
+                continue
+
+            # 准备每个项的父路径零散片段
+            parts_map: Dict[int, List[str]] = {}
+            max_parts = 0
+            for idx in idxs:
+                try:
+                    parent_parts = list(Path(items[idx]["path"]).parent.parts)
+                except Exception:
+                    parent_parts = []
+                parts_map[idx] = parent_parts
+                if len(parent_parts) > max_parts:
+                    max_parts = len(parent_parts)
+
+            resolved = False
+            # 从最近一级父目录开始追加，逐级增加直到唯一
+            for depth in range(1, max_parts + 1):
+                candidate_map: Dict[str, List[int]] = {}
+                for idx in idxs:
+                    parts = parts_map.get(idx, [])
+                    if depth <= len(parts):
+                        used = parts[-depth:]
+                    else:
+                        used = parts
+                    display = "/".join(used + [items[idx]["name"]]) if used else items[idx]["name"]
+                    candidate_map.setdefault(display.lower(), []).append(idx)
+
+                # 检查是否所有候选 display 唯一
+                if all(len(v) == 1 for v in candidate_map.values()):
+                    for disp, lst in candidate_map.items():
+                        items[lst[0]]["display_name"] = disp
+                    resolved = True
+                    break
+
+            if not resolved:
+                # 退化为完整父路径 + name，保证唯一性
+                for idx in idxs:
+                    try:
+                        full_parent = Path(items[idx]["path"]).parent.as_posix()
+                    except Exception:
+                        full_parent = ""
+                    if full_parent:
+                        items[idx]["display_name"] = f"{full_parent}/{items[idx]['name']}"
+                    else:
+                        items[idx]["display_name"] = items[idx]["name"]
+
+        return items
 
     def refresh_once(self) -> None:
         cfg = load_runtime_config()
@@ -1158,10 +1227,270 @@ class AutoScanService:
             }
 
 
+class LlamaParameterService:
+    _SECTION_ALLOWLIST = {"Common params", "Sampling params", "Server-specific params"}
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._parameters: List[Dict] = self._default_parameters()
+        self._source = "builtin"
+        self._updated_at = ""
+        self._error = ""
+        self._started = False
+
+    def _default_parameters(self) -> List[Dict]:
+        return [
+            {"name": "--model", "aliases": ["-m"], "description": "模型路径", "value_hint": "FNAME", "section": "Server-specific params"},
+            {"name": "--host", "aliases": [], "description": "监听地址", "value_hint": "HOST", "section": "Server-specific params"},
+            {"name": "--port", "aliases": [], "description": "监听端口", "value_hint": "PORT", "section": "Server-specific params"},
+            {"name": "--ctx-size", "aliases": ["-c"], "description": "上下文长度", "value_hint": "N", "section": "Common params"},
+            {"name": "--threads", "aliases": ["-t"], "description": "CPU 线程数", "value_hint": "N", "section": "Common params"},
+            {"name": "--n-gpu-layers", "aliases": ["-ngl", "--gpu-layers"], "description": "GPU 层数", "value_hint": "N", "section": "Server-specific params"},
+            {"name": "--temp", "aliases": ["--temperature"], "description": "采样温度", "value_hint": "N", "section": "Sampling params"},
+            {"name": "--top-p", "aliases": [], "description": "Top-p 采样", "value_hint": "N", "section": "Sampling params"},
+            {"name": "--top-k", "aliases": [], "description": "Top-k 采样", "value_hint": "N", "section": "Sampling params"},
+            {"name": "--repeat-penalty", "aliases": [], "description": "重复惩罚", "value_hint": "N", "section": "Sampling params"},
+            {"name": "--repeat-last-n", "aliases": [], "description": "重复惩罚窗口", "value_hint": "N", "section": "Sampling params"},
+            {"name": "--draft-max", "aliases": ["--draft-n", "--spec-draft-n-max"], "description": "草稿最大 token 数", "value_hint": "N", "section": "Server-specific params"},
+            {"name": "--draft-min", "aliases": ["--draft-n-min", "--spec-draft-n-min"], "description": "草稿最小 token 数", "value_hint": "N", "section": "Server-specific params"},
+        ]
+
+    def _cache_path(self) -> Path:
+        cfg = load_runtime_config()
+        cache_file = str(cfg.get("param_cache_file", ".cache/llama_params.json")).strip() or ".cache/llama_params.json"
+        path = Path(cache_file)
+        if not path.is_absolute():
+            path = APP_ROOT / path
+        return path
+
+    def _readme_url(self) -> str:
+        cfg = load_runtime_config()
+        url = str(cfg.get("param_readme_url", "")).strip()
+        return url or "https://raw.githubusercontent.com/ggml-org/llama.cpp/master/tools/server/README.md"
+
+    def _sync_enabled(self) -> bool:
+        cfg = load_runtime_config()
+        return bool(cfg.get("param_sync_enabled", False))
+
+    def _sync_interval(self) -> int:
+        cfg = load_runtime_config()
+        interval = cfg.get("param_sync_interval_seconds", 86400)
+        return interval if isinstance(interval, int) and interval > 0 else 86400
+
+    @staticmethod
+    def _clean_description(text: str) -> str:
+        return re.sub(r"\s+", " ", (text or "").replace("\u00a0", " ")).strip()
+
+    @staticmethod
+    def _extract_flags(raw_flags: str) -> List[str]:
+        flags: List[str] = []
+        for chunk in (raw_flags or "").split(","):
+            match = re.search(r"(--?[A-Za-z0-9][A-Za-z0-9-]*)", chunk.strip())
+            if match:
+                flag = match.group(1).strip()
+                if flag not in flags:
+                    flags.append(flag)
+        return flags
+
+    @staticmethod
+    def _extract_value_hint(raw_flags: str, primary_flag: str) -> str:
+        for chunk in (raw_flags or "").split(","):
+            chunk = chunk.strip()
+            if primary_flag not in chunk:
+                continue
+            hint = chunk.split(primary_flag, 1)[1].strip()
+            hint = hint.lstrip(",").strip()
+            if hint.startswith("<") and hint.endswith(">"):
+                hint = hint[1:-1].strip()
+            return hint
+        return ""
+
+    def _parse_readme(self, text: str) -> List[Dict]:
+        items: List[Dict] = []
+        seen = set()
+        current_section = ""
+        in_target_section = False
+
+        for line in text.splitlines():
+            heading = re.match(r"^###\s+(.+)$", line.strip())
+            if heading:
+                current_section = heading.group(1).strip()
+                in_target_section = current_section in self._SECTION_ALLOWLIST
+                continue
+
+            if not in_target_section:
+                continue
+
+            stripped = line.strip()
+            if not stripped.startswith("|"):
+                continue
+
+            columns = [cell.strip() for cell in stripped.strip("|").split("|")]
+            if len(columns) < 2:
+                continue
+
+            raw_flags = columns[0]
+            description = self._clean_description(columns[1])
+            if not raw_flags or not description:
+                continue
+            if re.fullmatch(r"[-\s]+", raw_flags):
+                continue
+
+            flags = self._extract_flags(raw_flags)
+            if not flags:
+                continue
+
+            primary_flag = next((flag for flag in flags if flag.startswith("--")), flags[0])
+            if primary_flag in seen:
+                continue
+
+            seen.add(primary_flag)
+            items.append(
+                {
+                    "name": primary_flag,
+                    "aliases": flags,
+                    "description": description,
+                    "value_hint": self._extract_value_hint(raw_flags, primary_flag),
+                    "section": current_section,
+                }
+            )
+
+        return items
+
+    def _load_cache(self) -> List[Dict]:
+        cache_path = self._cache_path()
+        if not cache_path.exists():
+            return []
+
+        try:
+            payload = json.loads(cache_path.read_text(encoding="utf-8"))
+            items = payload.get("items") if isinstance(payload, dict) else None
+            if not isinstance(items, list):
+                return []
+
+            normalized: List[Dict] = []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name", "")).strip()
+                if not name:
+                    continue
+                aliases = item.get("aliases") if isinstance(item.get("aliases"), list) else []
+                normalized.append(
+                    {
+                        "name": name,
+                        "aliases": [str(alias).strip() for alias in aliases if str(alias).strip()],
+                        "description": self._clean_description(str(item.get("description", ""))),
+                        "value_hint": self._clean_description(str(item.get("value_hint", ""))),
+                        "section": str(item.get("section", "")).strip(),
+                    }
+                )
+            return normalized
+        except Exception:
+            return []
+
+    def _save_cache(self, items: List[Dict], source: str) -> None:
+        cache_path = self._cache_path()
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_text(
+                json.dumps(
+                    {
+                        "source": source,
+                        "updated_at": utc_now_iso(),
+                        "items": items,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
+    def _download_readme(self) -> str:
+        req = Request(self._readme_url(), headers={"User-Agent": "llama-manager/1.0"})
+        with urlopen(req, timeout=20) as resp:
+            return resp.read().decode("utf-8", errors="replace")
+
+    def refresh_from_cache(self) -> Dict:
+        cached = self._load_cache()
+        with self._lock:
+            if cached:
+                self._parameters = cached
+                self._source = "cache"
+                self._error = ""
+                self._updated_at = utc_now_iso()
+            elif not self._parameters:
+                self._parameters = self._default_parameters()
+                self._source = "builtin"
+        return self.get_parameters()
+
+    def sync_once(self) -> Dict:
+        try:
+            readme = self._download_readme()
+            items = self._parse_readme(readme)
+            if not items:
+                raise ValueError("未能从 README 中解析到参数表")
+            with self._lock:
+                self._parameters = items
+                self._source = "remote"
+                self._error = ""
+                self._updated_at = utc_now_iso()
+            self._save_cache(items, "remote")
+        except (HTTPError, URLError, TimeoutError, ValueError) as exc:
+            with self._lock:
+                self._error = str(exc)
+                if not self._parameters:
+                    self._parameters = self._default_parameters()
+                    self._source = "builtin"
+                    self._updated_at = utc_now_iso()
+        except Exception as exc:
+            with self._lock:
+                self._error = str(exc)
+                if not self._parameters:
+                    self._parameters = self._default_parameters()
+                    self._source = "builtin"
+                    self._updated_at = utc_now_iso()
+        return self.get_parameters()
+
+    def start(self) -> None:
+        if self._started:
+            return
+        self._started = True
+        self.refresh_from_cache()
+
+        if not self._sync_enabled():
+            return
+
+        def loop() -> None:
+            while True:
+                try:
+                    self.sync_once()
+                except Exception:
+                    pass
+                time.sleep(self._sync_interval())
+
+        threading.Thread(target=loop, daemon=True).start()
+
+    def get_parameters(self) -> Dict:
+        with self._lock:
+            return {
+                "items": list(self._parameters),
+                "source": self._source,
+                "updated_at": self._updated_at,
+                "error": self._error,
+                "count": len(self._parameters),
+                "sync_enabled": self._sync_enabled(),
+            }
+
+
 app = Flask(__name__)
 manager = InstanceManager()
 auto_scan_service = AutoScanService(manager)
 auto_scan_service.start()
+param_service = LlamaParameterService()
+param_service.start()
 
 
 DAEMON_PROCESS_NAME = "daemon.py"
@@ -1302,15 +1631,18 @@ def update_instance(instance_id: str):
             freeform_args=body.get("freeform_args", ""),
             env_vars=body.get("env_vars", []),
         )
-        # 通过 TCP 停止旧进程并启动新进程（重启）
-        _control_request({"action": "stop", "target": "instance", "instance_id": instance_id})
-        start_resp = _control_request({
-            "action": "start", "target": "instance", "instance_id": instance_id
-        })
-        if start_resp and start_resp.get("success"):
-            inst = start_resp.get("instance", {})
-            updated["status"] = inst.get("status", updated.get("status"))
-            updated["pid"] = inst.get("pid")
+        # 尝试通过 daemon 的 TCP 控制接口重启实例：先 stop 再 start
+        try:
+            # 停止旧进程（若在运行）
+            _control_request({"action": "stop", "target": "instance", "instance_id": instance_id})
+            # 启动实例（重启）
+            start_resp = _control_request({"action": "start", "target": "instance", "instance_id": instance_id})
+            if start_resp and start_resp.get("success"):
+                return jsonify(start_resp.get("instance", updated))
+        except Exception:
+            # 忽略控制请求错误，仍返回已保存的实例信息
+            pass
+
         return jsonify(updated)
     except Exception as e:
         return jsonify({"error": str(e)}), 400
@@ -1319,8 +1651,6 @@ def update_instance(instance_id: str):
 @app.route("/api/instances/<instance_id>", methods=["DELETE"])
 def delete_instance(instance_id: str):
     try:
-        # 先通过 TCP 停止进程（best effort）
-        _control_request({"action": "stop", "target": "instance", "instance_id": instance_id})
         result = manager.delete_instance(instance_id)
         return jsonify(result)
     except Exception as e:
@@ -1561,6 +1891,16 @@ def discover_llama():
 @app.get("/api/models/discover")
 def discover_models():
     return jsonify(auto_scan_service.get_models())
+
+
+@app.get("/api/llama/parameters")
+def get_llama_parameters():
+    return jsonify(param_service.get_parameters())
+
+
+@app.post("/api/llama/parameters/refresh")
+def refresh_llama_parameters():
+    return jsonify(param_service.sync_once())
 
 
 if __name__ == "__main__":

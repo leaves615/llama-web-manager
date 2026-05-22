@@ -58,6 +58,10 @@ const api = {
     const res = await fetch("/api/models/discover");
     return await res.json();
   },
+  async getLlamaParameters() {
+    const res = await fetch("/api/llama/parameters");
+    return await res.json();
+  },
   async daemonStart() {
     const res = await fetch("/api/daemon/start", { method: "POST" });
     return await res.json();
@@ -600,6 +604,10 @@ data() {
         previewText: "尚未生成",
         versionOptions: [],
         modelOptions: [],
+        flagSuggestions: [],
+        flagSuggestOpenIndex: -1,
+        flagSuggestActiveIndex: -1,
+        flagSuggestItems: [],
         nCtxOptions: ["2048", "4096", "8192", "16384", "32768", "65536", "131072", "262144", "524288", "1048576"],
         activeTab: 'params'
       };
@@ -700,7 +708,7 @@ data() {
     },
     async loadOptions() {
       try {
-        const [vData, mData] = await Promise.all([api.discoverVersions(), api.discoverModels()]);
+        const [vData, mData, pData] = await Promise.all([api.discoverVersions(), api.discoverModels(), api.getLlamaParameters()]);
         this.versionOptions = (vData.items || []).map(item => ({
           value: item.path || item,
           label: item.name || item.path || item
@@ -709,9 +717,141 @@ data() {
           value: item.path || item,
           label: item.name || item.path || item
         }));
+        this.flagSuggestions = this.normalizeFlagSuggestions(pData.items || []);
       } catch (e) {
         console.error(e);
       }
+    },
+    normalizeFlagSuggestions(items) {
+      const seen = new Set();
+      const normalized = [];
+      (items || []).forEach(item => {
+        if (!item || !item.name) return;
+        const canonical = String(item.name || "").trim();
+        if (!canonical || seen.has(canonical)) return;
+        seen.add(canonical);
+        const aliases = Array.isArray(item.aliases) ? item.aliases : [];
+        const allKeys = [canonical, ...aliases]
+          .map(k => String(k || "").trim())
+          .filter(Boolean)
+          .filter((k, i, arr) => arr.indexOf(k) === i);
+        const description = item.description || "";
+        const valueHint = String(item.value_hint || "")
+          .replace(/^\[|\]$/g, "")
+          .replace(/^<|>$/g, "")
+          .trim();
+        normalized.push({
+          value: canonical,
+          aliases: allKeys,
+          label: description ? `${canonical} - ${description}` : canonical,
+          description,
+          valueHint,
+          section: item.section || ""
+        });
+      });
+      return normalized;
+    },
+    scoreFlagSuggestion(item, queryRaw) {
+      const query = String(queryRaw || "").trim().toLowerCase();
+      if (!query) return 0;
+      const queryNoDash = query.replace(/^-+/, "");
+      const value = String(item.value || "").toLowerCase();
+      const valueNoDash = value.replace(/^-+/, "");
+      const aliases = (item.aliases || []).map(a => String(a || "").toLowerCase());
+      const desc = String(item.description || "").toLowerCase();
+
+      if (value === query) return 100;
+      if (aliases.includes(query)) return 95;
+      if (value.startsWith(query)) return 90;
+      if (valueNoDash.startsWith(queryNoDash)) return 80;
+      if (aliases.some(a => a.startsWith(query))) return 75;
+      if (aliases.some(a => a.replace(/^-+/, "").startsWith(queryNoDash))) return 65;
+      if (value.includes(query)) return 55;
+      if (aliases.some(a => a.includes(query))) return 45;
+      if (desc.includes(queryNoDash)) return 30;
+      return 0;
+    },
+    filterFlagSuggestions(query) {
+      const q = String(query || "").trim();
+      if (!q) {
+        return this.flagSuggestions
+          .filter(item => String(item.value || "").startsWith("--"))
+          .slice(0, 12);
+      }
+      return this.flagSuggestions
+        .map(item => ({ item, score: this.scoreFlagSuggestion(item, q) }))
+        .filter(x => x.score > 0)
+        .sort((a, b) => b.score - a.score || a.item.value.localeCompare(b.item.value))
+        .map(x => x.item)
+        .slice(0, 12);
+    },
+    openFlagSuggestions(index) {
+      clearTimeout(this._flagSuggestCloseTimer);
+      const query = this.extraFlags[index]?.key || "";
+      this.flagSuggestItems = this.filterFlagSuggestions(query);
+      this.flagSuggestOpenIndex = index;
+      this.flagSuggestActiveIndex = this.flagSuggestItems.length ? 0 : -1;
+    },
+    delayCloseFlagSuggestions() {
+      clearTimeout(this._flagSuggestCloseTimer);
+      this._flagSuggestCloseTimer = setTimeout(() => {
+        this.closeFlagSuggestions();
+      }, 120);
+    },
+    closeFlagSuggestions() {
+      this.flagSuggestOpenIndex = -1;
+      this.flagSuggestActiveIndex = -1;
+      this.flagSuggestItems = [];
+    },
+    showFlagSuggestions(index) {
+      return this.flagSuggestOpenIndex === index && this.flagSuggestItems.length > 0;
+    },
+    moveFlagSuggest(step) {
+      if (this.flagSuggestOpenIndex < 0 || !this.flagSuggestItems.length) return;
+      const max = this.flagSuggestItems.length - 1;
+      const next = Math.min(max, Math.max(0, this.flagSuggestActiveIndex + step));
+      this.flagSuggestActiveIndex = next;
+    },
+    applyActiveFlagSuggestion(index) {
+      if (!this.showFlagSuggestions(index)) return;
+      const item = this.flagSuggestItems[this.flagSuggestActiveIndex];
+      if (!item) return;
+      this.applyFlagSuggestion(index, item);
+    },
+    applyFlagSuggestion(index, item) {
+      if (!this.extraFlags[index]) return;
+      this.extraFlags[index].key = item.value;
+      if (!this.extraFlags[index].value && item.valueHint) {
+        this.extraFlags[index].value = item.valueHint;
+      }
+      this.closeFlagSuggestions();
+      this.debouncedPreview();
+    },
+    findFlagSuggestion(flagKey) {
+      const raw = String(flagKey || "").trim();
+      if (!raw) return null;
+      const variants = new Set([raw]);
+      if (raw.startsWith("--")) {
+        variants.add(raw.slice(2));
+      } else if (raw.startsWith("-")) {
+        variants.add(`-${raw.replace(/^-+/, "")}`);
+        variants.add(`--${raw.replace(/^-+/, "")}`);
+      } else {
+        variants.add(`--${raw}`);
+        variants.add(`-${raw}`);
+      }
+      return this.flagSuggestions.find(item => {
+        const aliases = Array.isArray(item.aliases) && item.aliases.length ? item.aliases : [item.value];
+        return aliases.some(alias => variants.has(alias));
+      });
+    },
+    flagPlaceholder(flagKey) {
+      const match = this.findFlagSuggestion(flagKey);
+      return match?.valueHint || "0.8";
+    },
+    flagHint(flagKey) {
+      const match = this.findFlagSuggestion(flagKey);
+      return match?.description || "";
     },
     addFlag() {
       this.extraFlags.push({ key: "", value: "", enabled: true });
@@ -752,10 +892,10 @@ data() {
           n_ctx: Number(this.nCtx) || null,
           n_threads: Number(this.nThreads) || null,
           gpu_layers: this.gpuLayers === "" ? null : Number(this.gpuLayers),
-          extra_flags: this.extraFlags.filter(f => f.enabled && f.key)
+          extra_flags: this.extraFlags.filter(f => f.key)
         },
         freeform_args: this.freeform,
-        env_vars: this.envVars.filter(e => e.enabled && e.key)
+        env_vars: this.envVars.filter(e => e.key)
       };
     },
     async save() {
@@ -913,12 +1053,39 @@ data() {
                   <button type="button" class="small" @click="addFlag">+ 添加</button>
                 </div>
                 <div v-for="(flag, idx) in extraFlags" :key="idx" class="flag-row">
-                  <input v-model="flag.key" placeholder="--temp" />
-                  <input v-model="flag.value" placeholder="0.8" />
+                  <div class="flag-key-wrap">
+                    <input
+                      v-model="flag.key"
+                      placeholder="--temp"
+                      autocomplete="off"
+                      @focus="openFlagSuggestions(idx)"
+                      @input="openFlagSuggestions(idx)"
+                      @keydown.down.prevent="moveFlagSuggest(1)"
+                      @keydown.up.prevent="moveFlagSuggest(-1)"
+                      @keydown.enter.prevent="applyActiveFlagSuggestion(idx)"
+                      @keydown.esc.prevent="closeFlagSuggestions()"
+                      @blur="delayCloseFlagSuggestions()"
+                    />
+                    <div v-if="showFlagSuggestions(idx)" class="flag-suggestions" @mousedown.prevent>
+                      <button
+                        v-for="(item, sIdx) in flagSuggestItems"
+                        :key="item.value"
+                        type="button"
+                        :class="['flag-suggestion-item', { active: sIdx === flagSuggestActiveIndex }]"
+                        @mousedown.prevent="applyFlagSuggestion(idx, item)"
+                      >
+                        <span class="flag-suggestion-main">{{ item.value }}</span>
+                        <span v-if="item.valueHint" class="flag-suggestion-hint">{{ item.valueHint }}</span>
+                        <span v-if="item.description" class="flag-suggestion-desc">{{ item.description }}</span>
+                      </button>
+                    </div>
+                  </div>
+                  <input v-model="flag.value" :placeholder="flagPlaceholder(flag.key)" />
                   <label class="flag-enable">
                     <input type="checkbox" v-model="flag.enabled" />启用
                   </label>
                   <button type="button" class="danger small" @click="removeFlag(idx)">删除</button>
+                  <div v-if="flagHint(flag.key)" class="flag-hint">{{ flagHint(flag.key) }}</div>
                 </div>
               </div>
 

@@ -8,3 +8,7 @@ model_scan_max_depth: 5
 model_extensions:
   - .gguf
   - .bin
+param_sync_enabled: true
+param_sync_interval_seconds: 86400
+param_cache_file: .cache/llama_params.json
+param_readme_url: https://raw.githubusercontent.com/ggml-org/llama.cpp/master/tools/server/README.md
