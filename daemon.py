@@ -18,6 +18,7 @@ from typing import Dict, List, Optional
 
 import psutil
 import yaml
+import atexit
 
 
 APP_ROOT = Path(__file__).parent
@@ -27,6 +28,17 @@ CONFIG_FILE = APP_ROOT / "config.yaml"
 DAEMON_LOG_FILE = LOG_DIR / "daemon.log"
 DAEMON_PID_FILE = APP_ROOT / "daemon.pid"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _cleanup_pid_file():
+    try:
+        if DAEMON_PID_FILE.exists():
+            DAEMON_PID_FILE.unlink()
+    except Exception:
+        pass
+
+
+atexit.register(_cleanup_pid_file)
 
 
 def find_free_port():
@@ -39,18 +51,39 @@ def find_free_port():
 
 def write_daemon_pid(port: int):
     """写入 daemon PID 和端口信息"""
-    with open(DAEMON_PID_FILE, "w") as f:
-        f.write(f"{os.getpid()}\n{port}\n")
+    # 使用临时文件并原子替换，避免部分写入导致读取方解析失败
+    import tempfile
+    dirpath = str(APP_ROOT)
+    fd, tmp = tempfile.mkstemp(dir=dirpath)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(f"{os.getpid()}\n{port}\n")
+        os.replace(tmp, str(DAEMON_PID_FILE))
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except Exception:
+            pass
+        raise
 
 
 def read_daemon_info():
     """读取 daemon PID 和端口信息"""
     if not DAEMON_PID_FILE.exists():
         return None, None
-    with open(DAEMON_PID_FILE, "r") as f:
-        lines = f.read().strip().split("\n")
-    if len(lines) >= 2:
-        return int(lines[0]), int(lines[1])
+    try:
+        with open(DAEMON_PID_FILE, "r", encoding="utf-8") as f:
+            text = f.read()
+        lines = [l for l in text.splitlines() if l.strip()]
+        if len(lines) >= 2:
+            try:
+                pid = int(lines[0].strip())
+                port = int(lines[1].strip())
+                return pid, port
+            except ValueError:
+                return None, None
+    except Exception:
+        return None, None
     return None, None
 
 

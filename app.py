@@ -18,6 +18,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 import psutil
+import fcntl
 
 
 APP_ROOT = Path(__file__).parent
@@ -29,13 +30,17 @@ def _get_daemon_info() -> Optional[tuple]:
     if not DAEMON_PID_FILE.exists():
         return None
     try:
-        with open(DAEMON_PID_FILE, "r") as f:
-            lines = f.read().strip().split("\n")
+        with open(DAEMON_PID_FILE, "r", encoding="utf-8") as f:
+            text = f.read()
+        lines = [l for l in text.splitlines() if l.strip()]
         if len(lines) < 2:
             return None
-        pid = int(lines[0])
-        port = int(lines[1])
-        return pid, port
+        try:
+            pid = int(lines[0].strip())
+            port = int(lines[1].strip())
+            return pid, port
+        except ValueError:
+            return None
     except Exception:
         return None
 
@@ -66,21 +71,20 @@ def _is_daemon_running() -> bool:
     
     # 验证TCP端口连通性
     try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(1)
-        result = sock.connect_ex(("127.0.0.1", port))
-        sock.close()
-        if result == 0:
-            return True
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(1)
+            result = sock.connect_ex(("127.0.0.1", port))
+            if result == 0:
+                return True
         try:
             DAEMON_PID_FILE.unlink()
-        except:
+        except Exception:
             pass
         return False
     except Exception:
         try:
             DAEMON_PID_FILE.unlink()
-        except:
+        except Exception:
             pass
         return False
 
@@ -100,17 +104,21 @@ def _control_request(request: Dict, timeout: float = 10) -> Optional[Dict]:
     except psutil.NoSuchProcess:
         return None
 
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(timeout)
-        sock.connect(("127.0.0.1", port))
-        sock.sendall((json.dumps(request) + "\n").encode("utf-8"))
-        response = sock.recv(8192)
-        sock.close()
-        return json.loads(response.decode("utf-8"))
-    except Exception as e:
-        print(f"TCP request failed: {e}")
-        return None
+    # 简单重试机制以提高鲁棒性
+    attempts = 3
+    for attempt in range(attempts):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(timeout)
+                sock.connect(("127.0.0.1", port))
+                sock.sendall((json.dumps(request) + "\n").encode("utf-8"))
+                response = sock.recv(8192)
+                return json.loads(response.decode("utf-8"))
+        except Exception as e:
+            if attempt == attempts - 1:
+                print(f"TCP request failed: {e}")
+                return None
+            time.sleep(0.2 * (attempt + 1))
 
 
 def stop_daemon_via_tcp() -> bool:
@@ -1505,7 +1513,33 @@ def _ensure_daemon_running():
         return
 
 
-_ensure_daemon_running()
+# 在首次处理请求时确保守护进程在运行，避免模块导入时在 debug 重载场景重复启动
+@app.before_first_request
+def ensure_daemon_on_first_request():
+    lock_path = APP_ROOT / "daemon.lock"
+    try:
+        # 以阻塞式文件锁保护：只有获得锁的进程会尝试启动 daemon
+        lock_fd = open(lock_path, "w")
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            # 其他进程正在初始化 daemon，直接返回
+            lock_fd.close()
+            return
+
+        # 双重检查，防止竞争
+        if _is_daemon_running():
+            try:
+                lock_fd.close()
+            except Exception:
+                pass
+            return
+
+        _start_daemon_process()
+        # 延长等待时间以适应慢启动场景
+        _wait_for_daemon_ready(timeout=30)
+    except Exception as e:
+        print(f"Failed to ensure daemon running: {e}")
 
 
 def _sse_event(event: str, payload: Dict) -> str:
