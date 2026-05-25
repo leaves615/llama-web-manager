@@ -18,7 +18,12 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 import psutil
-import fcntl
+
+# Platform-specific imports for file locking
+if sys.platform == "win32":
+    import msvcrt
+else:
+    import fcntl
 
 
 APP_ROOT = Path(__file__).parent
@@ -1513,16 +1518,53 @@ def _ensure_daemon_running():
         return
 
 
-# 在首次处理请求时确保守护进程在运行，避免模块导入时在 debug 重载场景重复启动
-@app.before_first_request
-def ensure_daemon_on_first_request():
+def _acquire_file_lock(lock_fd):
+    """Cross-platform file locking"""
+    if sys.platform == "win32":
+        try:
+            msvcrt.locking(lock_fd.fileno(), msvcrt.LK_NBLCK, 1)
+            return True
+        except OSError:
+            return False
+    else:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            return False
+
+
+def _release_file_lock(lock_fd):
+    """Release cross-platform file lock"""
+    if sys.platform == "win32":
+        try:
+            msvcrt.locking(lock_fd.fileno(), msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+    else:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        except Exception:
+            pass
+
+
+# Module-level flag for first request initialization
+_daemon_initialized = False
+
+
+def _ensure_daemon_ready():
+    """Initialize daemon on first request (Flask 2.0+ compatible)"""
+    global _daemon_initialized
+    if _daemon_initialized:
+        return
+    
+    _daemon_initialized = True
     lock_path = APP_ROOT / "daemon.lock"
+    lock_fd = None
     try:
         # 以阻塞式文件锁保护：只有获得锁的进程会尝试启动 daemon
         lock_fd = open(lock_path, "w")
-        try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+        if not _acquire_file_lock(lock_fd):
             # 其他进程正在初始化 daemon，直接返回
             lock_fd.close()
             return
@@ -1530,6 +1572,7 @@ def ensure_daemon_on_first_request():
         # 双重检查，防止竞争
         if _is_daemon_running():
             try:
+                _release_file_lock(lock_fd)
                 lock_fd.close()
             except Exception:
                 pass
@@ -1540,6 +1583,26 @@ def ensure_daemon_on_first_request():
         _wait_for_daemon_ready(timeout=30)
     except Exception as e:
         print(f"Failed to ensure daemon running: {e}")
+    finally:
+        if lock_fd:
+            try:
+                _release_file_lock(lock_fd)
+                lock_fd.close()
+            except Exception:
+                pass
+
+
+# Flask 2.0+ compatible initialization
+if hasattr(app, 'before_serving'):
+    # Flask 2.1+
+    @app.before_serving
+    def init_daemon():
+        _ensure_daemon_ready()
+else:
+    # Flask 2.0 fallback
+    @app.before_request
+    def init_daemon_before_request():
+        _ensure_daemon_ready()
 
 
 def _sse_event(event: str, payload: Dict) -> str:
