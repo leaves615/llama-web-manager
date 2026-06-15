@@ -148,7 +148,7 @@ def kill_process_tree(pid: int, include_parent: bool = True) -> bool:
     for child in children:
         _safe_terminate(child)
 
-    gone, alive = psutil.wait_procs(children, timeout=3)
+    gone, alive = psutil.wait_procs(children, timeout=60)
     for p in alive:
         _safe_kill(p)
 
@@ -157,11 +157,11 @@ def kill_process_tree(pid: int, include_parent: bool = True) -> bool:
         try:
             parent.terminate()
             try:
-                parent.wait(timeout=3)
+                parent.wait(timeout=60)
             except psutil.TimeoutExpired:
                 _safe_kill(parent)
                 try:
-                    parent.wait(timeout=3)
+                    parent.wait(timeout=10)
                 except (psutil.TimeoutExpired, psutil.NoSuchProcess):
                     pass
         except (psutil.NoSuchProcess, psutil.AccessDenied):
@@ -245,6 +245,8 @@ class LlamaInstance:
         creationflags = 0
         if os.name == "nt":
             creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            new_session = True
 
         env = os.environ.copy()
         for item in self.env_vars:
@@ -271,6 +273,7 @@ class LlamaInstance:
             errors="replace",
             bufsize=1,
             creationflags=creationflags,
+            start_new_session=new_session if os.name != "nt" else False,
             env=env,
         )
 
@@ -649,11 +652,11 @@ class DaemonManager:
                 proc = psutil.Process(pid)
                 proc.terminate()
                 try:
-                    proc.wait(timeout=5)
+                    proc.wait(timeout=60)
                 except psutil.TimeoutExpired:
                     proc.kill()
-                    proc.wait(timeout=3)
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    proc.wait(timeout=10)
+            except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
                 pass
 
         # 2. 成功后再更新 DB

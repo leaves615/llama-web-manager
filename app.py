@@ -94,6 +94,20 @@ def _is_daemon_running() -> bool:
         return False
 
 
+def _read_json_response(sock):
+    """从 socket 按行读取完整的 JSON 响应（以 \n 结尾）"""
+    buffer = b''
+    while True:
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise IOError("Connection closed before receiving complete response")
+        buffer += chunk
+        # 尝试找到第一个换行符
+        if b'\n' in buffer:
+            line = buffer.split(b'\n', 1)[0]
+            return json.loads(line.decode("utf-8"))
+
+
 def _control_request(request: Dict, timeout: float = 10) -> Optional[Dict]:
     """向 daemon 发送 TCP 控制请求"""
     info = _get_daemon_info()
@@ -117,8 +131,8 @@ def _control_request(request: Dict, timeout: float = 10) -> Optional[Dict]:
                 sock.settimeout(timeout)
                 sock.connect(("127.0.0.1", port))
                 sock.sendall((json.dumps(request) + "\n").encode("utf-8"))
-                response = sock.recv(8192)
-                return json.loads(response.decode("utf-8"))
+                response = _read_json_response(sock)
+                return response
         except Exception as e:
             if attempt == attempts - 1:
                 print(f"TCP request failed: {e}")
@@ -1702,7 +1716,7 @@ def create_instance():
 
 @app.post("/api/instances/<instance_id>/stop")
 def stop_instance(instance_id: str):
-    response = _control_request({"action": "stop", "target": "instance", "instance_id": instance_id})
+    response = _control_request({"action": "stop", "target": "instance", "instance_id": instance_id}, timeout=75)
     if response and response.get("success"):
         return jsonify(response.get("instance", {}))
     return jsonify({"error": response.get("error", "failed") if response else "daemon not running"}), 400
@@ -1731,7 +1745,7 @@ def update_instance(instance_id: str):
         # 尝试通过 daemon 的 TCP 控制接口重启实例：先 stop 再 start
         try:
             # 停止旧进程（若在运行）
-            _control_request({"action": "stop", "target": "instance", "instance_id": instance_id})
+            _control_request({"action": "stop", "target": "instance", "instance_id": instance_id}, timeout=75)
             # 启动实例（重启）
             start_resp = _control_request({"action": "start", "target": "instance", "instance_id": instance_id})
             if start_resp and start_resp.get("success"):

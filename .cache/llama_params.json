@@ -1,6 +1,6 @@
 {
   "source": "remote",
-  "updated_at": "2026-05-25T09:34:14.577937+08:00",
+  "updated_at": "2026-06-14T21:13:32.735466+08:00",
   "items": [
     {
       "name": "--help",
@@ -19,15 +19,6 @@
         "--version"
       ],
       "description": "show version and build info",
-      "value_hint": "`",
-      "section": "Common params"
-    },
-    {
-      "name": "--license",
-      "aliases": [
-        "--license"
-      ],
-      "description": "show source code license and dependencies",
       "value_hint": "`",
       "section": "Common params"
     },
@@ -726,7 +717,7 @@
       "aliases": [
         "--log-file"
       ],
-      "description": "Log to file<br/>(env: LLAMA_LOG_FILE)",
+      "description": "Log to file<br/>(env: LLAMA_ARG_LOG_FILE)",
       "value_hint": "FNAME`",
       "section": "Common params"
     },
@@ -755,7 +746,7 @@
       "aliases": [
         "--offline"
       ],
-      "description": "Offline mode: forces use of cache, prevents network access<br/>(env: LLAMA_OFFLINE)",
+      "description": "Offline mode: forces use of cache, prevents network access<br/>(env: LLAMA_ARG_OFFLINE)",
       "value_hint": "`",
       "section": "Common params"
     },
@@ -766,7 +757,7 @@
         "--verbosity",
         "--log-verbosity"
       ],
-      "description": "Set the verbosity threshold. Messages with a higher verbosity will be ignored. Values:<br/> - 0: generic output<br/> - 1: error<br/> - 2: warning<br/> - 3: info<br/> - 4: debug<br/>(default: 3)<br/><br/>(env: LLAMA_LOG_VERBOSITY)",
+      "description": "Set the verbosity threshold. Messages with a higher verbosity will be ignored. Values:<br/> - 0: generic output<br/> - 1: error<br/> - 2: warning<br/> - 3: info<br/> - 4: trace (more info)<br/> - 5: debug<br/>(default: 3)<br/><br/>(env: LLAMA_ARG_LOG_VERBOSITY)",
       "value_hint": "",
       "section": "Common params"
     },
@@ -1159,12 +1150,12 @@
       "section": "Server-specific params"
     },
     {
-      "name": "--checkpoint-every-n-tokens",
+      "name": "--checkpoint-min-step",
       "aliases": [
-        "-cpent",
-        "--checkpoint-every-n-tokens"
+        "-cms",
+        "--checkpoint-min-step"
       ],
-      "description": "create a checkpoint every n tokens during prefill (processing), -1 to disable (default: 8192)<br/>(env: LLAMA_ARG_CHECKPOINT_EVERY_NT)",
+      "description": "minimum spacing between context checkpoints in tokens (default: 256, 0 = no minimum)<br/>(env: LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT)",
       "value_hint": "N`",
       "section": "Server-specific params"
     },
@@ -1196,7 +1187,7 @@
         "--cache-idle-slots",
         "--no-cache-idle-slots"
       ],
-      "description": "save and clear idle slots on new task (default: enabled, requires unified KV and cache-ram)<br/>(env: LLAMA_ARG_CACHE_IDLE_SLOTS)",
+      "description": "save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)<br/>(env: LLAMA_ARG_CACHE_IDLE_SLOTS)",
       "value_hint": "",
       "section": "Server-specific params"
     },
@@ -1287,6 +1278,26 @@
         "--mmproj"
       ],
       "description": "path to a multimodal projector file. see tools/mtmd/README.md<br/>note: if -hf is used, this argument can be omitted<br/>(env: LLAMA_ARG_MMPROJ)",
+      "value_hint": "FILE`",
+      "section": "Server-specific params"
+    },
+    {
+      "name": "--talker-model",
+      "aliases": [
+        "-tk",
+        "--talker-model"
+      ],
+      "description": "path to the qwen3-omni talker gguf, enables the /v1/audio/speech endpoint<br/>(env: LLAMA_ARG_TALKER_MODEL)",
+      "value_hint": "FILE`",
+      "section": "Server-specific params"
+    },
+    {
+      "name": "--code2wav-model",
+      "aliases": [
+        "-c2w",
+        "--code2wav-model"
+      ],
+      "description": "path to the qwen3-omni code2wav gguf, the talker code detokenizer<br/>(env: LLAMA_ARG_CODE2WAV_MODEL)",
       "value_hint": "FILE`",
       "section": "Server-specific params"
     },
@@ -1531,7 +1542,7 @@
       "aliases": [
         "--api-key-file"
       ],
-      "description": "path to file containing API keys (default: none)",
+      "description": "path to file containing API keys (default: none)<br/>(env: LLAMA_ARG_API_KEY_FILE)",
       "value_hint": "FNAME`",
       "section": "Server-specific params"
     },
@@ -1558,7 +1569,7 @@
       "aliases": [
         "--chat-template-kwargs"
       ],
-      "description": "sets additional params for the json template parser, must be a valid json object string, e.g. '{\"key1\":\"value1\",\"key2\":\"value2\"}'<br/>(env: LLAMA_CHAT_TEMPLATE_KWARGS)",
+      "description": "sets additional params for the json template parser, must be a valid json object string, e.g. '{\"key1\":\"value1\",\"key2\":\"value2\"}'<br/>(env: LLAMA_ARG_CHAT_TEMPLATE_KWARGS)",
       "value_hint": "STRING`",
       "section": "Server-specific params"
     },
@@ -1568,7 +1579,7 @@
         "-to",
         "--timeout"
       ],
-      "description": "server read/write timeout in seconds (default: 600)<br/>(env: LLAMA_ARG_TIMEOUT)",
+      "description": "server read/write timeout in seconds (default: 3600)<br/>(env: LLAMA_ARG_TIMEOUT)",
       "value_hint": "N`",
       "section": "Server-specific params"
     },
@@ -1735,7 +1746,7 @@
       "aliases": [
         "--chat-template"
       ],
-      "description": "set custom jinja chat template (default: template taken from model's metadata)<br/>if suffix/prefix are specified, template will be disabled<br/>only commonly used templates are accepted (unless --jinja is set before this flag):<br/>list of built-in templates:<br/>bailing, bailing-think, bailing2, chatglm3, chatglm4, chatml, command-r, deepseek, deepseek-ocr, deepseek2, deepseek3, exaone-moe, exaone3, exaone4, falcon3, gemma, gigachat, glmedge, gpt-oss, granite, granite-4.0, grok-2, hunyuan-dense, hunyuan-moe, hunyuan-vl, kimi-k2, llama2, llama2-sys, llama2-sys-bos, llama2-sys-strip, llama3, llama4, megrez, minicpm, mistral-v1, mistral-v3, mistral-v3-tekken, mistral-v7, mistral-v7-tekken, monarch, openchat, orion, pangu-embedded, phi3, phi4, rwkv-world, seed_oss, smolvlm, solar-open, vicuna, vicuna-orca, yandex, zephyr<br/>(env: LLAMA_ARG_CHAT_TEMPLATE)",
+      "description": "set custom jinja chat template (default: template taken from model's metadata)<br/>if suffix/prefix are specified, template will be disabled<br/>only commonly used templates are accepted (unless --jinja is set before this flag):<br/>list of built-in templates:<br/>bailing, bailing-think, bailing2, chatglm3, chatglm4, chatml, command-r, deepseek, deepseek-ocr, deepseek2, deepseek3, exaone-moe, exaone3, exaone4, falcon3, gemma, gigachat, glmedge, gpt-oss, granite, granite-4.0, granite-4.1, grok-2, hunyuan-dense, hunyuan-moe, hunyuan-vl, kimi-k2, llama2, llama2-sys, llama2-sys-bos, llama2-sys-strip, llama3, llama4, megrez, minicpm, mistral-v1, mistral-v3, mistral-v3-tekken, mistral-v7, mistral-v7-tekken, monarch, openchat, orion, pangu-embedded, phi3, phi4, rwkv-world, seed_oss, smolvlm, solar-open, vicuna, vicuna-orca, yandex, zephyr<br/>(env: LLAMA_ARG_CHAT_TEMPLATE)",
       "value_hint": "JINJA_TEMPLATE`",
       "section": "Server-specific params"
     },
@@ -1744,7 +1755,7 @@
       "aliases": [
         "--chat-template-file"
       ],
-      "description": "set custom jinja chat template file (default: template taken from model's metadata)<br/>if suffix/prefix are specified, template will be disabled<br/>only commonly used templates are accepted (unless --jinja is set before this flag):<br/>list of built-in templates:<br/>bailing, bailing-think, bailing2, chatglm3, chatglm4, chatml, command-r, deepseek, deepseek-ocr, deepseek2, deepseek3, exaone-moe, exaone3, exaone4, falcon3, gemma, gigachat, glmedge, gpt-oss, granite, granite-4.0, grok-2, hunyuan-dense, hunyuan-moe, hunyuan-vl, kimi-k2, llama2, llama2-sys, llama2-sys-bos, llama2-sys-strip, llama3, llama4, megrez, minicpm, mistral-v1, mistral-v3, mistral-v3-tekken, mistral-v7, mistral-v7-tekken, monarch, openchat, orion, pangu-embedded, phi3, phi4, rwkv-world, seed_oss, smolvlm, solar-open, vicuna, vicuna-orca, yandex, zephyr<br/>(env: LLAMA_ARG_CHAT_TEMPLATE_FILE)",
+      "description": "set custom jinja chat template file (default: template taken from model's metadata)<br/>if suffix/prefix are specified, template will be disabled<br/>only commonly used templates are accepted (unless --jinja is set before this flag):<br/>list of built-in templates:<br/>bailing, bailing-think, bailing2, chatglm3, chatglm4, chatml, command-r, deepseek, deepseek-ocr, deepseek2, deepseek3, exaone-moe, exaone3, exaone4, falcon3, gemma, gigachat, glmedge, gpt-oss, granite, granite-4.0, granite-4.1, grok-2, hunyuan-dense, hunyuan-moe, hunyuan-vl, kimi-k2, llama2, llama2-sys, llama2-sys-bos, llama2-sys-strip, llama3, llama4, megrez, minicpm, mistral-v1, mistral-v3, mistral-v3-tekken, mistral-v7, mistral-v7-tekken, monarch, openchat, orion, pangu-embedded, phi3, phi4, rwkv-world, seed_oss, smolvlm, solar-open, vicuna, vicuna-orca, yandex, zephyr<br/>(env: LLAMA_ARG_CHAT_TEMPLATE_FILE)",
       "value_hint": "JINJA_TEMPLATE_FILE`",
       "section": "Server-specific params"
     },
@@ -1992,6 +2003,16 @@
         "--draft-p-min"
       ],
       "description": "minimum speculative decoding probability (greedy) (default: 0.00)<br/>(env: LLAMA_ARG_SPEC_DRAFT_P_MIN)",
+      "value_hint": "",
+      "section": "Server-specific params"
+    },
+    {
+      "name": "--spec-draft-backend-sampling",
+      "aliases": [
+        "--spec-draft-backend-sampling",
+        "--no-spec-draft-backend-sampling"
+      ],
+      "description": "offload draft sampling to the backend (default: enabled)<br/>(env: LLAMA_ARG_SPEC_DRAFT_BACKEND_SAMPLING)",
       "value_hint": "",
       "section": "Server-specific params"
     },
