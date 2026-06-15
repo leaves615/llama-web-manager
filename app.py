@@ -962,8 +962,6 @@ class InstanceManager:
         n_ctx = visual_args.get("n_ctx")
         n_threads = visual_args.get("n_threads")
         gpu_layers = visual_args.get("gpu_layers")
-        draft_max = visual_args.get("draft_max")
-        draft_min = visual_args.get("draft_min")
         extra_kv = visual_args.get("extra_flags") or []
 
         if model:
@@ -980,10 +978,6 @@ class InstanceManager:
             cmd.extend(["--threads", str(n_threads)])
         if gpu_layers is not None and str(gpu_layers).strip() != "":
             cmd.extend(["--n-gpu-layers", str(gpu_layers)])
-        if draft_max is not None:
-            cmd.extend(["--draft-max", str(draft_max)])
-        if draft_min is not None:
-            cmd.extend(["--draft-min", str(draft_min)])
 
         for item in extra_kv:
             enabled_raw = item.get("enabled", True)
@@ -1278,8 +1272,7 @@ class LlamaParameterService:
             {"name": "--top-k", "aliases": [], "description": "Top-k 采样", "value_hint": "N", "section": "Sampling params"},
             {"name": "--repeat-penalty", "aliases": [], "description": "重复惩罚", "value_hint": "N", "section": "Sampling params"},
             {"name": "--repeat-last-n", "aliases": [], "description": "重复惩罚窗口", "value_hint": "N", "section": "Sampling params"},
-            {"name": "--draft-max", "aliases": ["--draft-n", "--spec-draft-n-max"], "description": "草稿最大 token 数", "value_hint": "N", "section": "Server-specific params"},
-            {"name": "--draft-min", "aliases": ["--draft-n-min", "--spec-draft-n-min"], "description": "草稿最小 token 数", "value_hint": "N", "section": "Server-specific params"},
+
         ]
 
     def _cache_path(self) -> Path:
@@ -1949,8 +1942,6 @@ def _build_partial_command(server_dir: str, visual_args: Dict, freeform_args: st
         n_ctx = visual_args.get("n_ctx")
         n_threads = visual_args.get("n_threads")
         gpu_layers = visual_args.get("gpu_layers")
-        draft_max = visual_args.get("draft_max")
-        draft_min = visual_args.get("draft_min")
         extra_kv = visual_args.get("extra_flags") or []
         if model:
             cmd.extend(["--model", model])
@@ -1966,10 +1957,6 @@ def _build_partial_command(server_dir: str, visual_args: Dict, freeform_args: st
             cmd.extend(["--threads", str(n_threads)])
         if gpu_layers is not None and str(gpu_layers).strip() != "":
             cmd.extend(["--n-gpu-layers", str(gpu_layers)])
-        if draft_max is not None:
-            cmd.extend(["--draft-max", str(draft_max)])
-        if draft_min is not None:
-            cmd.extend(["--draft-min", str(draft_min)])
         for item in extra_kv:
             enabled_raw = item.get("enabled", True)
             enabled = enabled_raw if isinstance(enabled_raw, bool) else str(enabled_raw).strip().lower() not in {"0", "false", "off", "no"}

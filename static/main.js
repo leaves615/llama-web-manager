@@ -591,8 +591,6 @@ data() {
         serverDir: "",
         modelPath: "",
         draftModelPath: "",
-        draftMax: "16",
-        draftMin: "4",
         host: "0.0.0.0",
         port: "8080",
         nCtx: "32768",
@@ -638,8 +636,6 @@ data() {
           this.serverDir = val.executable_path || "";
           this.modelPath = val.visual_args?.model_path || "";
           this.draftModelPath = val.visual_args?.draft_model_path || "";
-          this.draftMax = String(val.visual_args?.draft_max || "16");
-          this.draftMin = String(val.visual_args?.draft_min || "4");
           this.host = val.visual_args?.host || "0.0.0.0";
           this.port = val.visual_args?.port || "8080";
           this.nCtx = String(val.visual_args?.n_ctx || "32768");
@@ -673,8 +669,6 @@ data() {
       }
     },
     draftModelPath() { this.debouncedPreview(); },
-    draftMax() { this.debouncedPreview(); },
-    draftMin() { this.debouncedPreview(); },
     host() { this.debouncedPreview(); },
     port() { this.debouncedPreview(); },
     nCtx() { this.debouncedPreview(); },
@@ -695,8 +689,6 @@ data() {
       this.serverDir = "";
       this.modelPath = "";
       this.draftModelPath = "";
-      this.draftMax = "16";
-      this.draftMin = "4";
       this.host = "0.0.0.0";
       this.port = "8080";
       this.nCtx = "32768";
@@ -885,8 +877,6 @@ data() {
         visual_args: {
           model_path: this.modelPath.trim(),
           draft_model_path: this.hasDraftModel ? this.draftModelPath.trim() : null,
-          draft_max: this.hasDraftModel ? (Number(this.draftMax) || null) : null,
-          draft_min: this.hasDraftModel ? (Number(this.draftMin) || null) : null,
           host: this.host.trim(),
           port: Number(this.port) || null,
           n_ctx: Number(this.nCtx) || null,
@@ -959,21 +949,6 @@ data() {
                   <option value="">请选择</option>
                   <option v-for="m in modelOptions" :key="m.value" :value="m.value">{{ m.label }}</option>
                 </select>
-              </div>
-            </div>
-          </div>
-
-          <!-- 草稿模型参数 -->
-          <div class="form-section" v-if="hasDraftModel">
-            <div class="section-title">草稿模型参数</div>
-            <div class="form-grid two">
-              <div class="form-group">
-                <label>最大草稿数</label>
-                <input v-model="draftMax" type="number" placeholder="16" />
-              </div>
-              <div class="form-group">
-                <label>最小草稿数</label>
-                <input v-model="draftMin" type="number" placeholder="4" />
               </div>
             </div>
           </div>
