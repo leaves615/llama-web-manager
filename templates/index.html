@@ -43,12 +43,14 @@
         </section>
 
         <section class="panel log-panel">
-          <div class="list-header">
-            <h2>日志查看</h2>
-            <div class="log-head-actions">
-              <span id="currentInstance">{{ currentInstanceName }}</span>
-              <button id="enlargeLogBtn" type="button" class="enlarge-btn" title="放大查看" @click="showLogLarge = true">⛶</button>
+          <div class="log-panel-header">
+            <div class="log-panel-info">
+              <div class="log-panel-title-row">
+                <h2>日志查看 <span v-if="selectedInstanceId" class="log-instance-name">{{ currentInstanceName }}</span></h2>
+              </div>
+              <div v-if="currentInstanceCommand" class="log-panel-command">{{ currentInstanceCommand }}</div>
             </div>
+            <button id="enlargeLogBtn" type="button" class="enlarge-btn" title="放大查看" @click="showLogLarge = true">⛶</button>
           </div>
           <log-viewer
             :instance-id="selectedInstanceId"

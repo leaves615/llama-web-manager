@@ -1183,7 +1183,12 @@ const app = createApp({
     currentInstanceName() {
       if (!this.selectedInstanceId) return "未选择实例";
       const inst = this.instances.find(i => i.instance_id === this.selectedInstanceId);
-      return inst ? `当前：${inst.name}` : "未选择实例";
+      return inst ? inst.name : "未选择实例";
+    },
+    currentInstanceCommand() {
+      if (!this.selectedInstanceId) return "";
+      const inst = this.instances.find(i => i.instance_id === this.selectedInstanceId);
+      return inst && Array.isArray(inst.command) ? inst.command.join(" ") : "";
     }
   },
   mounted() {
