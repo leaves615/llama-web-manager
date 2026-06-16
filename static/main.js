@@ -591,6 +591,7 @@ data() {
         serverDir: "",
         modelPath: "",
         draftModelPath: "",
+        mmprojPath: "",
         host: "0.0.0.0",
         port: "8080",
         nCtx: "32768",
@@ -636,6 +637,7 @@ data() {
           this.serverDir = val.executable_path || "";
           this.modelPath = val.visual_args?.model_path || "";
           this.draftModelPath = val.visual_args?.draft_model_path || "";
+          this.mmprojPath = val.visual_args?.mmproj_path || "";
           this.host = val.visual_args?.host || "0.0.0.0";
           this.port = val.visual_args?.port || "8080";
           this.nCtx = String(val.visual_args?.n_ctx || "32768");
@@ -669,6 +671,7 @@ data() {
       }
     },
     draftModelPath() { this.debouncedPreview(); },
+    mmprojPath() { this.debouncedPreview(); },
     host() { this.debouncedPreview(); },
     port() { this.debouncedPreview(); },
     nCtx() { this.debouncedPreview(); },
@@ -689,6 +692,7 @@ data() {
       this.serverDir = "";
       this.modelPath = "";
       this.draftModelPath = "";
+      this.mmprojPath = "";
       this.host = "0.0.0.0";
       this.port = "8080";
       this.nCtx = "32768";
@@ -705,10 +709,17 @@ data() {
           value: item.path || item,
           label: item.name || item.path || item
         }));
-        this.modelOptions = (mData.items || []).map(item => ({
-          value: item.path || item,
-          label: item.name || item.path || item
-        }));
+        this.modelOptions = (mData.items || []).map(item => {
+          const p = item.path || item;
+          const name = item.name || p;
+          const parts = p.split(/[/\\]/);
+          const parent = parts.length >= 2 ? parts[parts.length - 2] : "";
+          return {
+            value: p,
+            label: name,
+            displayLabel: parent ? parent + "/" + name : name
+          };
+        });
         this.flagSuggestions = this.normalizeFlagSuggestions(pData.items || []);
       } catch (e) {
         console.error(e);
@@ -877,6 +888,7 @@ data() {
         visual_args: {
           model_path: this.modelPath.trim(),
           draft_model_path: this.hasDraftModel ? this.draftModelPath.trim() : null,
+          mmproj_path: this.mmprojPath.trim() || null,
           host: this.host.trim(),
           port: Number(this.port) || null,
           n_ctx: Number(this.nCtx) || null,
@@ -936,7 +948,7 @@ data() {
                 <label>或选择扫描模型</label>
                 <select v-model="modelPath">
                   <option value="">请选择</option>
-                  <option v-for="m in modelOptions" :key="m.value" :value="m.value">{{ m.label }}</option>
+                  <option v-for="m in modelOptions" :key="m.value" :value="m.value">{{ m.displayLabel }}</option>
                 </select>
               </div>
               <div class="form-group">
@@ -947,7 +959,18 @@ data() {
                 <label>或选择扫描模型</label>
                 <select v-model="draftModelPath">
                   <option value="">请选择</option>
-                  <option v-for="m in modelOptions" :key="m.value" :value="m.value">{{ m.label }}</option>
+                  <option v-for="m in modelOptions" :key="m.value" :value="m.value">{{ m.displayLabel }}</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label>mmproj 路径</label>
+                <input v-model="mmprojPath" placeholder="多模态投影模型" />
+              </div>
+              <div class="form-group">
+                <label>或选择扫描模型</label>
+                <select v-model="mmprojPath">
+                  <option value="">请选择</option>
+                  <option v-for="m in modelOptions" :key="m.value" :value="m.value">{{ m.displayLabel }}</option>
                 </select>
               </div>
             </div>

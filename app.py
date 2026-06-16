@@ -957,6 +957,7 @@ class InstanceManager:
 
         model = (visual_args.get("model_path") or "").strip()
         draft_model = (visual_args.get("draft_model_path") or "").strip()
+        mmproj = (visual_args.get("mmproj_path") or "").strip()
         host = (visual_args.get("host") or "").strip()
         port = visual_args.get("port")
         n_ctx = visual_args.get("n_ctx")
@@ -968,6 +969,8 @@ class InstanceManager:
             cmd.extend(["--model", model])
         if draft_model:
             cmd.extend(["--model-draft", draft_model])
+        if mmproj:
+            cmd.extend(["--mmproj", mmproj])
         if host:
             cmd.extend(["--host", host])
         if port:
