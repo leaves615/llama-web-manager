@@ -4,4 +4,4 @@ __pycache__/
 self_docs/
 AGENTS.md
 *.pid
-.cache/
+.cache/*

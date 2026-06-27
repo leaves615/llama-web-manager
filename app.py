@@ -456,24 +456,8 @@ class InstanceManager:
                     ),
                 )
 
-    def _update_instance_status(self, instance_id: str, pid: int | None, status: str) -> None:
-        with self._db_lock:
-            with self._db_conn() as conn:
-                conn.execute(
-                    "UPDATE instances SET pid = ?, status = ?, updated_at = ? WHERE instance_id = ?",
-                    (pid, status, utc_now_iso(), instance_id),
-                )
-
     def _list_persisted_instances(self) -> List[Dict]:
-        # 首先检查 daemon 是否还在运行，如果不运行则清理所有running状态的实例
-        if not _is_daemon_running():
-            with self._db_lock:
-                with self._db_conn() as conn:
-                    conn.execute(
-                        "UPDATE instances SET status = 'exited', pid = NULL, updated_at = ? WHERE status = 'running'",
-                        (utc_now_iso(),),
-                    )
-        
+        """列出 DB 中的实例（不验证进程状态，状态由 daemon 通过 TCP 返回）"""
         with self._db_lock:
             with self._db_conn() as conn:
                 rows = conn.execute(
@@ -482,40 +466,13 @@ class InstanceManager:
 
         items: List[Dict] = []
         for row in rows:
-            # 验证进程状态：如果数据库显示running但进程不存在，则更新为exited
-            status = row["status"]
-            pid = row["pid"]
-            instance_id = row["instance_id"]
-            
-            if status == "running" and pid:
-                try:
-                    proc = psutil.Process(pid)
-                    if not proc.is_running():
-                        # 进程已结束，更新数据库
-                        with self._db_lock:
-                            with self._db_conn() as conn:
-                                conn.execute(
-                                    "UPDATE instances SET status = 'exited', pid = NULL, updated_at = ? WHERE instance_id = ?",
-                                    (utc_now_iso(), instance_id),
-                                )
-                        status = "exited"
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    # 进程不存在，更新数据库
-                    with self._db_lock:
-                        with self._db_conn() as conn:
-                            conn.execute(
-                                "UPDATE instances SET status = 'exited', pid = NULL, updated_at = ? WHERE instance_id = ?",
-                                (utc_now_iso(), instance_id),
-                            )
-                    status = "exited"
-            
             items.append(
                 {
                     "instance_id": row["instance_id"],
                     "name": row["name"],
                     "executable_path": row["executable_path"],
                     "pid": row["pid"],
-                    "status": status,
+                    "status": row["status"],
                     "created_at": row["created_at"],
                     "command": json.loads(row["command_json"]),
                     "log_file": row["log_file"],
@@ -790,91 +747,6 @@ class InstanceManager:
             "env_vars": env_vars,
         }
 
-    def start_instance(self, instance_id: str) -> Dict:
-        persisted = self._get_persisted_instance(instance_id)
-        if not persisted:
-            raise ValueError("实例不存在")
-
-        command = self._build_command(
-            server_dir=persisted["executable_path"],
-            visual_args=persisted["visual_args"],
-            freeform_args=persisted["freeform_args"],
-        )
-
-        self._db_execute(
-            "UPDATE instances SET command_json = ?, command = 'start', updated_at = ? WHERE instance_id = ?",
-            (json.dumps(command, ensure_ascii=False), utc_now_iso(), instance_id),
-        )
-
-        return {
-            "instance_id": instance_id,
-            "name": persisted["name"],
-            "executable_path": persisted["executable_path"],
-            "command": command,
-            "pid": persisted.get("pid"),
-            "status": "starting",
-            "created_at": persisted["created_at"],
-            "log_file": persisted["log_file"],
-            "visual_args": persisted["visual_args"],
-            "freeform_args": persisted["freeform_args"],
-            "env_vars": persisted.get("env_vars", []),
-        }
-
-    def update_instance(
-        self,
-        instance_id: str,
-        name: str,
-        server_dir: str,
-        visual_args: Dict,
-        freeform_args: str,
-        env_vars: List[Dict],
-    ) -> Dict:
-        if not server_dir:
-            raise ValueError("server_dir 不能为空")
-
-        persisted = self._get_persisted_instance(instance_id)
-        if not persisted:
-            raise ValueError("实例不存在")
-
-        command = self._build_command(server_dir, visual_args, freeform_args)
-        log_file = persisted["log_file"]
-
-        self._db_execute(
-            "UPDATE instances SET name = ?, executable_path = ?, command_json = ?, visual_args_json = ?, freeform_args = ?, env_vars_json = ?, command = 'start', updated_at = ? WHERE instance_id = ?",
-            (name, server_dir, json.dumps(command, ensure_ascii=False), json.dumps(visual_args, ensure_ascii=False), freeform_args, json.dumps(env_vars, ensure_ascii=False), utc_now_iso(), instance_id),
-        )
-
-        return {
-            "instance_id": instance_id,
-            "name": name,
-            "executable_path": server_dir,
-            "command": command,
-            "pid": persisted.get("pid"),
-            "status": "restarting",
-            "created_at": persisted["created_at"],
-            "log_file": log_file,
-            "visual_args": visual_args,
-            "freeform_args": freeform_args,
-            "env_vars": env_vars,
-        }
-
-    def stop_instance(self, instance_id: str) -> Dict:
-        persisted = self._get_persisted_instance(instance_id)
-        if not persisted:
-            raise ValueError("实例不存在")
-
-        self._db_execute(
-            "UPDATE instances SET command = 'stop', updated_at = ? WHERE instance_id = ?",
-            (utc_now_iso(), instance_id),
-        )
-
-        return {
-            "instance_id": instance_id,
-            "name": persisted["name"],
-            "status": "stopping",
-            "pid": persisted.get("pid"),
-        }
-
     def delete_instance(self, instance_id: str) -> Dict:
         persisted = self._get_persisted_instance(instance_id)
         if not persisted:
@@ -948,8 +820,6 @@ class InstanceManager:
                 should_update = current is record or current is None
                 if current is record:
                     self.instances.pop(record.instance_id, None)
-            if should_update:
-                self._update_instance_status(record.instance_id, final_pid, final_status)
 
     def _build_command(self, server_dir: str, visual_args: Dict, freeform_args: str) -> List[str]:
         executable = self._resolve_executable(server_dir)
@@ -1688,10 +1558,22 @@ def daemon_stop():
 
 @app.get("/api/instances")
 def list_instances():
+    # 从 DB 查询实例列表
+    db_instances = manager._list_persisted_instances()
+    
+    # 通过 TCP 获取实时状态
     response = _control_request({"action": "list", "target": "instance"})
     if response and response.get("success"):
-        return jsonify({"items": response.get("instances", [])})
-    return jsonify({"items": manager.list_instances()})
+        # 将 TCP 返回的实时状态合并到 DB 数据中
+        tcp_instances = {inst["instance_id"]: inst for inst in response.get("instances", [])}
+        for item in db_instances:
+            tcp_inst = tcp_instances.get(item["instance_id"])
+            if tcp_inst:
+                # 使用 TCP 返回的实时状态和 PID
+                item["status"] = tcp_inst.get("status", item["status"])
+                item["pid"] = tcp_inst.get("pid", item["pid"])
+    
+    return jsonify({"items": db_instances})
 
 
 @app.post("/api/instances")
@@ -1730,14 +1612,41 @@ def start_instance(instance_id: str):
 def update_instance(instance_id: str):
     body = request.get_json(silent=True) or {}
     try:
-        updated = manager.update_instance(
-            instance_id=instance_id,
-            name=body.get("name", ""),
-            server_dir=body.get("server_dir", body.get("executable_path", "")),
-            visual_args=body.get("visual_args", {}),
-            freeform_args=body.get("freeform_args", ""),
-            env_vars=body.get("env_vars", []),
+        name = body.get("name", "")
+        server_dir = body.get("server_dir", body.get("executable_path", ""))
+        visual_args = body.get("visual_args", {})
+        freeform_args = body.get("freeform_args", "")
+        env_vars = body.get("env_vars", [])
+
+        if not server_dir:
+            raise ValueError("server_dir 不能为空")
+
+        persisted = manager._get_persisted_instance(instance_id)
+        if not persisted:
+            raise ValueError("实例不存在")
+
+        command = manager._build_command(server_dir, visual_args, freeform_args)
+
+        # 直接更新 DB
+        manager._db_execute(
+            "UPDATE instances SET name = ?, executable_path = ?, command_json = ?, visual_args_json = ?, freeform_args = ?, env_vars_json = ?, updated_at = ? WHERE instance_id = ?",
+            (name, server_dir, json.dumps(command, ensure_ascii=False), json.dumps(visual_args, ensure_ascii=False), freeform_args, json.dumps(env_vars, ensure_ascii=False), utc_now_iso(), instance_id),
         )
+
+        updated = {
+            "instance_id": instance_id,
+            "name": name,
+            "executable_path": server_dir,
+            "command": command,
+            "pid": persisted.get("pid"),
+            "status": "restarting",
+            "created_at": persisted["created_at"],
+            "log_file": persisted["log_file"],
+            "visual_args": visual_args,
+            "freeform_args": freeform_args,
+            "env_vars": env_vars,
+        }
+
         # 尝试通过 daemon 的 TCP 控制接口重启实例：先 stop 再 start
         try:
             # 停止旧进程（若在运行）
