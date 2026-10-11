@@ -148,29 +148,67 @@ def kill_process_tree(pid: int, include_parent: bool = True) -> bool:
     for child in children:
         _safe_terminate(child)
 
-    gone, alive = psutil.wait_procs(children, timeout=60)
+    gone, alive = psutil.wait_procs(children, timeout=3)
     for p in alive:
         _safe_kill(p)
+    if alive:
+        gone, alive = psutil.wait_procs(alive, timeout=2)
+        for p in alive:
+            daemon_logger.warning(f"子进程 {p.pid} 仍未退出，已尽力终止")
 
     # 终止父进程
     if include_parent:
         try:
             parent.terminate()
             try:
-                parent.wait(timeout=60)
+                parent.wait(timeout=3)
             except psutil.TimeoutExpired:
                 _safe_kill(parent)
                 try:
-                    parent.wait(timeout=10)
+                    parent.wait(timeout=2)
                 except (psutil.TimeoutExpired, psutil.NoSuchProcess):
                     pass
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
 
     try:
-        return not parent.is_running()
+        return not _pid_alive(pid)
     except (psutil.NoSuchProcess, psutil.AccessDenied):
         return True
+
+
+def _pid_alive(pid: int) -> bool:
+    """进程是否仍存活（僵尸态视为已退出，避免误判残留）"""
+    try:
+        proc = psutil.Process(pid)
+        if not proc.is_running():
+            return False
+        try:
+            if proc.status() in (psutil.STATUS_ZOMBIE, psutil.STATUS_DEAD):
+                return False
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            return False
+        return True
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return False
+
+
+def _send_response(conn: socket.socket, obj: Dict) -> None:
+    """发送换行结尾的 JSON 响应（客户端按行读取，缺换行会导致控制请求超时）"""
+    conn.sendall((json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8"))
+
+
+def _recv_request(conn: socket.socket, limit: int = 65536) -> str:
+    """读取到换行符为止的完整请求，避免大于 4096 字节时被截断"""
+    buf = b""
+    while b"\n" not in buf:
+        chunk = conn.recv(4096)
+        if not chunk:
+            break
+        buf += chunk
+        if len(buf) > limit:
+            break
+    return buf.decode("utf-8", errors="replace").strip()
 
 
 def now_iso():
@@ -224,22 +262,40 @@ class LlamaInstance:
 
     @property
     def pid(self) -> int:
-        return self.process.pid if self.process else 0
+        try:
+            return self.process.pid if self.process else 0
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            return 0
+
+    def _process_alive(self) -> bool:
+        """内存中的进程对象是否仍存活（Popen 走 poll，psutil 走存活判断）"""
+        proc = self.process
+        if proc is None:
+            return False
+        poll = getattr(proc, "poll", None)
+        if callable(poll):
+            try:
+                return proc.poll() is None
+            except Exception:
+                return False
+        try:
+            return _pid_alive(proc.pid)
+        except Exception:
+            return False
 
     @property
     def status(self) -> str:
         if self._stopped_by_manager:
             return "stopped"
-        if self.process:
-            try:
-                return "running" if self.process.poll() is None else f"exited({self.process.returncode})"
-            except AttributeError:
-                # process is a psutil.Process object, not subprocess.Popen
-                try:
-                    return "running" if self.process.is_running() else "exited"
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    return "exited"
-        return "stopped"
+        if self.process is None:
+            return "stopped"
+        if self._process_alive():
+            return "running"
+        try:
+            code = self.process.returncode
+        except Exception:
+            code = None
+        return f"exited({code})" if code is not None else "exited"
 
     def start(self):
         creationflags = 0
@@ -302,13 +358,11 @@ class LlamaInstance:
             except psutil.NoSuchProcess:
                 return True
 
-        # 最终验证
-        try:
-            if psutil.Process(pid).is_running():
-                daemon_logger.warning(f"Instance {self.name} (PID: {pid}) may still be running")
-                return False
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            pass
+        # 最终验证（僵尸态视为已退出）
+        if _pid_alive(pid):
+            daemon_logger.warning(f"Instance {self.name} (PID: {pid}) may still be running")
+            self._stopped_by_manager = False
+            return False
 
         daemon_logger.info(f"Stopped instance {self.name}")
         return True
@@ -386,9 +440,9 @@ class DaemonManager:
                     conn, addr = self._control_server.accept()
                     conn.settimeout(5)
                     try:
-                        data = conn.recv(4096).decode("utf-8").strip()
+                        data = _recv_request(conn)
                         if not data:
-                            conn.sendall(json.dumps({"success": False, "error": "empty request"}).encode())
+                            _send_response(conn, {"success": False, "error": "empty request"})
                             conn.close()
                             continue
 
@@ -398,36 +452,36 @@ class DaemonManager:
                         target = request.get("target")
 
                         if target is None:
-                            conn.sendall(json.dumps({"success": False, "error": "target is required"}).encode())
+                            _send_response(conn, {"success": False, "error": "target is required"})
                             conn.close()
                             continue
 
                         if action == "stop" and target == "daemon":
-                            conn.sendall(json.dumps({"success": True}).encode())
+                            _send_response(conn, {"success": True})
                             conn.close()
                             daemon_logger.info("Control server received stop command")
                             self._running = False
                             return
 
                         if action == "list" and target == "daemon":
-                            conn.sendall(json.dumps({
+                            _send_response(conn, {
                                 "success": True,
                                 "status": "running",
                                 "instances": len(self.instances)
-                            }).encode())
+                            })
                             conn.close()
                             continue
 
                         response = self._handle_command(request)
-                        conn.sendall(json.dumps(response, ensure_ascii=False).encode())
+                        _send_response(conn, response)
                         conn.close()
                     except json.JSONDecodeError as e:
-                        conn.sendall(json.dumps({"success": False, "error": f"invalid JSON: {e}"}).encode())
+                        _send_response(conn, {"success": False, "error": f"invalid JSON: {e}"})
                         conn.close()
                     except Exception as e:
                         daemon_logger.error(f"Control server error: {e}")
                         try:
-                            conn.sendall(json.dumps({"success": False, "error": str(e)}).encode())
+                            _send_response(conn, {"success": False, "error": str(e)})
                         except:
                             pass
                         conn.close()
@@ -486,30 +540,52 @@ class DaemonManager:
         return dict(row) if row else None
 
     def _matches_expected_command(self, proc: psutil.Process, expected_command: List[str]) -> bool:
+        """校验 PID 是否为本实例的进程：只比对可执行文件名，避免编辑改参后误判为残留"""
         if not expected_command:
             return True
         try:
             actual_command = proc.cmdline()
         except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
             return False
-        if len(actual_command) < len(expected_command):
+        if not actual_command:
             return False
-        return actual_command[: len(expected_command)] == expected_command
+        try:
+            expected_exe = Path(expected_command[0]).name
+            actual_exe = Path(actual_command[0]).name
+        except Exception:
+            return False
+        return actual_exe == expected_exe
+
+    def _serving_port(self, row: Dict) -> Optional[int]:
+        """从实例配置中解析服务端口，探测不到则返回 None（不影响存活判断）"""
+        try:
+            visual = json.loads(row.get("visual_args_json", "") or "") if row.get("visual_args_json") else {}
+            port = (visual or {}).get("port")
+            return int(port) if port else None
+        except (ValueError, TypeError):
+            return None
 
     def _probe_persisted_instance(self, row: Dict, instance: Optional["LlamaInstance"] = None) -> tuple[str, Optional[int]]:
         # Convert sqlite3.Row to dict for .get() compatibility
         if not isinstance(row, dict):
             row = dict(row)
-        
+
         status = row["status"]
         pid = row["pid"]
 
-        if instance and instance.process:
+        if instance is not None:
             try:
-                if instance.status == "running":
-                    return "running", instance.pid
+                mem_status = instance.status
             except Exception:
-                pass
+                mem_status = "stopped"
+            if mem_status == "running":
+                return "running", instance.pid
+            if mem_status.startswith("exited"):
+                self._db_execute(
+                    "UPDATE instances SET status = 'exited', pid = NULL, updated_at = ? WHERE instance_id = ?",
+                    (now_iso(), row["instance_id"]),
+                )
+                return "exited", None
 
         if status != "running":
             return status, pid
@@ -523,14 +599,13 @@ class DaemonManager:
 
         expected_command = json.loads(row.get("command_json", "") or "") if row.get("command_json") else []
         try:
-            proc = psutil.Process(pid)
-            if not proc.is_running():
+            if not _pid_alive(pid):
                 raise psutil.NoSuchProcess(pid)
-            proc_status = proc.status()
-            if proc_status in (psutil.STATUS_ZOMBIE, psutil.STATUS_DEAD):
+            if not self._matches_expected_command(psutil.Process(pid), expected_command):
                 raise psutil.NoSuchProcess(pid)
-            if not self._matches_expected_command(proc, expected_command):
-                raise psutil.NoSuchProcess(pid)
+            port = self._serving_port(row)
+            if port and not self._port_serving(port):
+                return "starting", pid
             return "running", pid
         except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
             self._db_execute(
@@ -538,6 +613,15 @@ class DaemonManager:
                 (now_iso(), row["instance_id"]),
             )
             return "exited", None
+
+    @staticmethod
+    def _port_serving(port: int, timeout: float = 0.5) -> bool:
+        """端口是否已有服务在监听（区分 starting/running，避免按钮提前显示停止）"""
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=timeout):
+                return True
+        except OSError:
+            return False
 
     def _serialize_instance(self, instance_id: str, instance: Optional["LlamaInstance"] = None) -> Dict:
         row = self._get_persisted_instance(instance_id)
@@ -572,24 +656,27 @@ class DaemonManager:
         if not row:
             return {"success": False, "error": "instance not found"}
 
-        # 内存级防护：已在运行则跳过
+        # 内存中的实例视为“需要先停后起”的重启请求：必须先停掉旧进程
         if instance_id in self.instances:
             inst = self.instances[instance_id]
-            if inst.status == "running":
-                return {"success": True, "instance": self._serialize_instance(instance_id, inst)}
-            # 存在但非 running，清理后重启
-            daemon_logger.info(f"Instance {inst.name} is {inst.status}, stopping and restarting...")
+            daemon_logger.info(f"Instance {inst.name} is {inst.status}, stopping old process before start...")
             try:
-                inst.stop()
+                ok = inst.stop()
             except Exception as e:
-                daemon_logger.warning(f"Error stopping exited instance {instance_id}: {e}")
-            del self.instances[instance_id]
+                daemon_logger.warning(f"Error stopping old instance {instance_id}: {e}")
+                ok = False
+            if _pid_alive(inst.pid):
+                return {"success": False, "error": f"旧进程 PID {inst.pid} 仍在运行，拒绝启动新进程"}
+            self.instances.pop(instance_id, None)
 
-        # DB 级防护：避免并发 TCP 请求重复启动
+        # DB 级防护：DB 显示 running 但内存无实例，说明旧进程可能残留，先按 PID 终止
         db_inst = self._get_persisted_instance(instance_id)
-        if db_inst and db_inst.get("status") == "running" and instance_id in self.instances:
-            daemon_logger.info(f"Instance {db_inst['name']} already running, skipping")
-            return {"success": True, "instance": self._serialize_instance(instance_id, self.instances[instance_id])}
+        old_pid = (db_inst or {}).get("pid") or 0
+        if old_pid and _pid_alive(old_pid):
+            daemon_logger.info(f"Instance {instance_id} 残留旧进程 PID {old_pid}，先终止再启动")
+            kill_process_tree(old_pid, include_parent=True)
+            if _pid_alive(old_pid):
+                return {"success": False, "error": f"旧进程 PID {old_pid} 仍在运行，拒绝启动新进程"}
 
         try:
             command = json.loads(row["command_json"])
@@ -625,41 +712,40 @@ class DaemonManager:
             return {"success": False, "error": str(e)}
 
     def _do_stop_instance(self, instance_id: str) -> Dict:
-        """停止单个实例"""
+        """停止单个实例：先确认进程真正退出，才更新 DB，避免新旧进程并存"""
         if not instance_id:
             return {"success": False, "error": "instance_id required"}
 
-        # 先检查 DB 状态，避免对已停止的实例做无用操作
         db_row = self._get_persisted_instance(instance_id)
-        if db_row and db_row.get("status") != "running":
+        if not db_row:
+            return {"success": False, "error": "instance not found"}
+        if db_row.get("status") != "running":
             return {"success": True, "instance": self._serialize_instance(instance_id)}
 
         instance = self.instances.get(instance_id)
+        stopped = False
+        pid = (instance.pid if instance else 0) or db_row.get("pid") or 0
 
         # 1. 先尝试 kill 进程（内存中或根据 PID）
         if instance:
             try:
-                instance.stop()
+                stopped = instance.stop()
             except Exception as e:
                 daemon_logger.error(f"Failed to stop instance {instance_id}: {e}")
-            finally:
-                del self.instances[instance_id]
-        elif db_row and db_row.get("pid"):
+                stopped = False
+            if stopped or not _pid_alive(pid):
+                self.instances.pop(instance_id, None)
+        elif pid:
             # 实例不在内存中，但 DB 显示 running — 尝试根据 PID 终止
-            pid = db_row["pid"]
             daemon_logger.info(f"Instance {db_row['name']} not in memory, killing PID {pid} directly")
-            try:
-                proc = psutil.Process(pid)
-                proc.terminate()
-                try:
-                    proc.wait(timeout=60)
-                except psutil.TimeoutExpired:
-                    proc.kill()
-                    proc.wait(timeout=10)
-            except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
-                pass
+            stopped = kill_process_tree(pid, include_parent=True)
 
-        # 2. 成功后再更新 DB
+        # 2. 以进程真实存活为准：还活着就如实报错，不更新 DB
+        if pid and _pid_alive(pid):
+            daemon_logger.error(f"实例 {instance_id} (PID: {pid}) 停止失败，进程仍存活")
+            return {"success": False, "error": f"进程 PID {pid} 仍在运行，停止失败"}
+
+        self.instances.pop(instance_id, None)
         self._db_execute(
             "UPDATE instances SET status = 'stopped', pid = NULL, updated_at = ? WHERE instance_id = ?",
             (now_iso(), instance_id),
@@ -709,41 +795,28 @@ class DaemonManager:
         return load_config()
 
     def scan_existing(self):
+        """daemon 启动时清理 DB 中的脏 running 记录：PID 已不存在才标 stopped"""
         cursor = self._db_execute("SELECT * FROM instances WHERE status = 'running'")
         rows = cursor.fetchall()
         for row in rows:
             pid = row["pid"]
-            if not pid:
-                continue
-            try:
-                process = psutil.Process(pid)
-                if not process.is_running():
-                    continue
-
-                instance_id = row["instance_id"]
+            instance_id = row["instance_id"]
+            if not pid or not _pid_alive(pid):
                 self._db_execute(
                     "UPDATE instances SET status = 'stopped', pid = NULL WHERE instance_id = ?",
                     (instance_id,),
                 )
                 daemon_logger.info(f"Marked stale instance {instance_id} as stopped")
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                self._db_execute(
-                    "UPDATE instances SET status = 'stopped', pid = NULL WHERE pid = ?",
-                    (pid,),
-                )
 
     def load_instances(self):
+        """daemon 启动时接管存活的旧进程：用 Popen 接管 PID，避免 stop 时找不到进程对象"""
         cursor = self._db_execute("SELECT * FROM instances WHERE status = 'running'")
         rows = cursor.fetchall()
         for row in rows:
             pid = row["pid"]
-            if not pid:
+            if not pid or not _pid_alive(pid):
                 continue
             try:
-                process = psutil.Process(pid)
-                if not process.is_running():
-                    continue
-
                 instance_id = row["instance_id"]
                 log_file = Path(row["log_file"])
 
@@ -758,10 +831,10 @@ class DaemonManager:
                     env_vars=json.loads(row.get("env_vars_json") or "[]"),
                     created_at=row["created_at"],
                 )
-                instance._stopped_by_manager = True
+                instance.process = psutil.Process(pid)
                 self.instances[instance_id] = instance
-                daemon_logger.info(f"Restored instance {instance.name} (PID: {pid})")
-            except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
+                daemon_logger.info(f"接管存活实例 {instance.name} (PID: {pid})")
+            except (psutil.NoSuchProcess, psutil.AccessDenied, OSError) as e:
                 daemon_logger.error(f"Failed to restore {row['instance_id']}: {e}")
 
     def check_status(self):
@@ -792,17 +865,23 @@ class DaemonManager:
                 continue
             instance_id = row["instance_id"]
             try:
-                proc = psutil.Process(pid)
-                status = proc.status()
-                if status not in (psutil.STATUS_RUNNING, psutil.STATUS_SLEEPING):
-                    self._db_execute(
-                        "UPDATE instances SET status = 'exited', pid = NULL, updated_at = ? WHERE instance_id = ?",
-                        (now_iso(), instance_id),
-                    )
-                    daemon_logger.warning(f"Instance {instance_id} process exited (status: {status})")
-                    # 清理内存中的已退出实例对象，避免重启时卡住
-                    if instance_id in self.instances:
+                # 内存中有对象且已退出：以内存状态为准落库
+                inst = self.instances.get(instance_id)
+                if inst is not None:
+                    try:
+                        mem_status = inst.status
+                    except Exception:
+                        mem_status = "stopped"
+                    if mem_status.startswith("exited"):
+                        self._db_execute(
+                            "UPDATE instances SET status = 'exited', pid = NULL, updated_at = ? WHERE instance_id = ?",
+                            (now_iso(), instance_id),
+                        )
+                        daemon_logger.warning(f"Instance {instance_id} process exited ({mem_status})")
                         del self.instances[instance_id]
+                        continue
+                if not _pid_alive(pid):
+                    raise psutil.NoSuchProcess(pid)
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 self._db_execute(
                     "UPDATE instances SET status = 'exited', pid = NULL, updated_at = ? WHERE instance_id = ?",

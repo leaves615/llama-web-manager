@@ -10,13 +10,18 @@ const api = {
     const res = await fetch("/api/instances");
     return await res.json();
   },
+  async _json(res) {
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || (`请求失败 (${res.status})`));
+    return data;
+  },
   async createInstance(data) {
     const res = await fetch("/api/instances", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(data)
     });
-    return await res.json();
+    return await this._json(res);
   },
   async updateInstance(id, data) {
     const res = await fetch(`/api/instances/${id}`, {
@@ -24,15 +29,15 @@ const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(data)
     });
-    return await res.json();
+    return await this._json(res);
   },
   async deleteInstance(id) {
     const res = await fetch(`/api/instances/${id}`, { method: "DELETE" });
-    return await res.json();
+    return await this._json(res);
   },
   async stopInstance(id) {
     const res = await fetch(`/api/instances/${id}/stop`, { method: "POST" });
-    return await res.json();
+    return await this._json(res);
   },
   async startInstance(id) {
     const res = await fetch(`/api/instances/${id}/start`, {
@@ -40,7 +45,7 @@ const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({})
     });
-    return await res.json();
+    return await this._json(res);
   },
   async previewCommand(data) {
     const res = await fetch("/api/command-preview", {
@@ -100,12 +105,36 @@ const InstanceList = {
   emits: ["select", "edit", "toggle", "copy", "delete"],
   computed: {
     firstRunning() {
-      return this.instances.find(i => String(i.status).startsWith("running"));
+      return this.instances.find(i => this.stateOf(i.status) === 'running');
     }
   },
   methods: {
-    isRunning(status) {
-      return String(status || "").startsWith("running");
+    stateOf(status) {
+      const s = String(status || "").toLowerCase();
+      if (s === "running") return "running";
+      if (s === "starting" || s === "restarting") return "transitional";
+      if (s === "stopped") return "stopped";
+      if (s.startsWith("exited")) return "exited";
+      if (s === "error") return "error";
+      return "stopped";
+    },
+    stateText(item) {
+      const s = this.stateOf(item.status);
+      if (s === "running") return `运行中 · PID ${item.pid ?? "-"}`;
+      if (s === "transitional") return "启动中 · 端口未就绪";
+      if (s === "exited") return "已退出（进程不在）";
+      if (s === "error") return "启动失败";
+      return "已停止";
+    },
+    toggleText(status) {
+      const s = this.stateOf(status);
+      if (s === "running") return "停止";
+      if (s === "transitional") return "启动中";
+      if (s === "exited" || s === "error") return "重新启动";
+      return "启动";
+    },
+    toggleBusy(item) {
+      return this.isLoading(item.instance_id) || this.stateOf(item.status) === "transitional";
     },
     isLoading(id) {
       return this.loadingIds?.has(id);
@@ -120,7 +149,7 @@ const InstanceList = {
         :class="['instance-card', { selected: item.instance_id === selectedId }]"
       >
         <strong>{{ item.name }}</strong>
-        <div class="meta">ID: {{ item.instance_id }} | PID: {{ item.pid }} | {{ item.status }}</div>
+        <div class="meta">ID: {{ item.instance_id }} | PID: {{ item.pid ?? '-' }} | {{ stateText(item) }}</div>
         <div class="cmd">{{ (item.command || []).join(" ") }}</div>
         <div class="instance-actions">
           <button class="view-log" @click.stop="$emit('select', item.instance_id, item.name)">查看日志</button>
@@ -128,11 +157,12 @@ const InstanceList = {
           <button class="edit" @click.stop="$emit('edit', item)">编辑</button>
           <button class="danger" @click.stop="$emit('delete', item)">删除</button>
           <button
-            :class="['toggle', 'loading-effect', isRunning(item.status) ? 'danger' : 'primary', { loading: isLoading(item.instance_id) }]"
-            :disabled="isLoading(item.instance_id)"
+            :class="['toggle', 'loading-effect', stateOf(item.status) === 'running' ? 'danger' : 'primary', { loading: toggleBusy(item) }]"
+            :disabled="toggleBusy(item)"
+            :title="stateOf(item.status) === 'transitional' ? '服务正在启动，端口就绪后自动变为运行中' : ''"
             @click.stop="$emit('toggle', item)"
           >
-            {{ isRunning(item.status) ? '停止' : '启动' }}
+            {{ toggleText(item.status) }}
           </button>
         </div>
       </div>
@@ -1013,13 +1043,6 @@ data() {
             <button type="button" class="small" @click="preview">刷新预览</button>
             <pre class="command-preview">{{ previewText }}</pre>
           </div>
-
-          <!-- 表单操作 -->
-          <div class="form-actions">
-            <button type="button" class="primary" @click="save" :class="{ loading: loading }">
-              {{ isEdit ? '保存并重启' : '创建实例' }}
-            </button>
-          </div>
         </div>
 
         <!-- 右侧 62% - Tab 容器 -->
@@ -1046,7 +1069,7 @@ data() {
             <div v-show="activeTab === 'params'" class="tab-pane">
               <!-- 额外参数 -->
               <div class="form-section">
-                <div class="section-title">
+                <div class="section-title sticky-title">
                   额外参数
                   <button type="button" class="small" @click="addFlag">+ 添加</button>
                 </div>
@@ -1097,7 +1120,7 @@ data() {
             <!-- Tab 2: 环境变量 -->
             <div v-show="activeTab === 'env'" class="tab-pane">
               <div class="form-section">
-                <div class="section-title">
+                <div class="section-title sticky-title">
                   环境变量
                   <button type="button" class="small" @click="addEnvVar">+ 添加</button>
                 </div>
@@ -1113,6 +1136,12 @@ data() {
             </div>
           </div>
         </div>
+      </div>
+      <div class="form-modal-foot">
+        <button type="button" class="secondary" @click="$emit('close')">关闭</button>
+        <button type="button" class="primary" @click="save" :class="{ loading: loading }">
+          {{ isEdit ? '保存并重启' : '创建实例' }}
+        </button>
       </div>
     </div>
   `
@@ -1217,7 +1246,7 @@ const app = createApp({
   mounted() {
     this.initSSE();
     this.refreshInstances().then(() => {
-      const running = this.instances.find(i => String(i.status).startsWith("running"));
+      const running = this.instances.find(i => i.status === "running");
       if (running) {
         this.selectInstance(running.instance_id, running.name);
       }
@@ -1321,35 +1350,57 @@ const app = createApp({
     },
   async saveForm(payload) {
       this.formLoading = true;
+      const id = this.editingInstance?.instance_id;
+      const idx = id ? this.instances.findIndex(i => i.instance_id === id) : -1;
+      const prev = idx >= 0 ? { ...this.instances[idx] } : null;
+      // 保存并重启期间按钮显示过渡态，失败回滚
+      if (idx >= 0) this.instances[idx] = { ...this.instances[idx], status: "starting" };
       try {
-        if (this.editingInstance?.instance_id) {
-          await api.updateInstance(this.editingInstance.instance_id, payload);
+        let data;
+        if (id) {
+          data = await api.updateInstance(id, payload);
         } else {
-          await api.createInstance(payload);
+          data = await api.createInstance(payload);
+        }
+        if (data && data.error) {
+          if (idx >= 0 && prev) this.instances[idx] = prev;
+          alert(data.error);
+          await this.refreshInstances();
+          return;
         }
         this.showForm = false;
         await this.refreshInstances();
       } catch (e) {
+        if (idx >= 0 && prev) this.instances[idx] = prev;
         alert(e.message);
+        await this.refreshInstances();
       } finally {
         this.formLoading = false;
       }
     },
     async toggleInstance(item) {
-      this.loadingIds.add(item.instance_id);
-      this.selectInstance(item.instance_id, item.name);
+      const id = item.instance_id;
+      this.loadingIds.add(id);
+      this.selectInstance(id, item.name);
+      // 先把按钮置为过渡态，避免用户在请求期间重复点击
+      const idx = this.instances.findIndex(i => i.instance_id === id);
+      const prev = idx >= 0 ? { ...this.instances[idx] } : null;
+      if (idx >= 0) this.instances[idx] = { ...this.instances[idx], status: "starting" };
       try {
-        if (String(item.status).startsWith("running")) {
-          await api.stopInstance(item.instance_id);
+        if (item.status === "running") {
+          await api.stopInstance(id);
         } else {
           this.currentLogs = [];
-          await api.startInstance(item.instance_id);
+          await api.startInstance(id);
         }
         await this.refreshInstances();
       } catch (e) {
+        // 失败回滚本地过渡态，按钮恢复为操作前的真实状态
+        if (idx >= 0 && prev) this.instances[idx] = prev;
         alert(e.message);
+        await this.refreshInstances();
       } finally {
-        this.loadingIds.delete(item.instance_id);
+        this.loadingIds.delete(id);
       }
     },
     closeStreams() {

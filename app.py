@@ -1518,11 +1518,19 @@ def daemon_status_stream():
                     yield _sse_event("status", status)
 
                 if running:
-                    items = manager.list_instances()
-                    instance_status = {item["instance_id"]: item.get("status") for item in items}
+                    db_items = manager._list_persisted_instances()
+                    response = _control_request({"action": "list", "target": "instance"})
+                    if response and response.get("success"):
+                        tcp_map = {inst["instance_id"]: inst for inst in response.get("instances", [])}
+                        for item in db_items:
+                            tcp_inst = tcp_map.get(item["instance_id"])
+                            if tcp_inst:
+                                item["status"] = tcp_inst.get("status", item["status"])
+                                item["pid"] = tcp_inst.get("pid", item["pid"])
+                    instance_status = {item["instance_id"]: (item.get("status"), item.get("pid")) for item in db_items}
                     if instance_status != last_instance_status:
                         last_instance_status = instance_status
-                        yield _sse_event("instances", {"items": items})
+                        yield _sse_event("instances", {"items": db_items})
 
             except Exception:
                 pass
@@ -1594,7 +1602,7 @@ def create_instance():
 
 @app.post("/api/instances/<instance_id>/stop")
 def stop_instance(instance_id: str):
-    response = _control_request({"action": "stop", "target": "instance", "instance_id": instance_id}, timeout=75)
+    response = _control_request({"action": "stop", "target": "instance", "instance_id": instance_id}, timeout=10)
     if response and response.get("success"):
         return jsonify(response.get("instance", {}))
     return jsonify({"error": response.get("error", "failed") if response else "daemon not running"}), 400
@@ -1602,7 +1610,7 @@ def stop_instance(instance_id: str):
 
 @app.post("/api/instances/<instance_id>/start")
 def start_instance(instance_id: str):
-    response = _control_request({"action": "start", "target": "instance", "instance_id": instance_id})
+    response = _control_request({"action": "start", "target": "instance", "instance_id": instance_id}, timeout=15)
     if response and response.get("success"):
         return jsonify(response.get("instance", {}))
     return jsonify({"error": response.get("error", "failed") if response else "daemon not running"}), 400
@@ -1639,7 +1647,7 @@ def update_instance(instance_id: str):
             "executable_path": server_dir,
             "command": command,
             "pid": persisted.get("pid"),
-            "status": "restarting",
+            "status": persisted.get("status"),
             "created_at": persisted["created_at"],
             "log_file": persisted["log_file"],
             "visual_args": visual_args,
@@ -1647,19 +1655,20 @@ def update_instance(instance_id: str):
             "env_vars": env_vars,
         }
 
-        # 尝试通过 daemon 的 TCP 控制接口重启实例：先 stop 再 start
-        try:
-            # 停止旧进程（若在运行）
-            _control_request({"action": "stop", "target": "instance", "instance_id": instance_id}, timeout=75)
-            # 启动实例（重启）
-            start_resp = _control_request({"action": "start", "target": "instance", "instance_id": instance_id})
-            if start_resp and start_resp.get("success"):
-                return jsonify(start_resp.get("instance", updated))
-        except Exception:
-            # 忽略控制请求错误，仍返回已保存的实例信息
-            pass
-
-        return jsonify(updated)
+        # 重启实例：先停旧进程（仅运行态），确认停掉才起新进程，避免新旧并存；
+        # 停止态编辑同样执行启动，保持“保存后实例必运行”的老语义
+        was_running = (persisted.get("status") == "running")
+        if was_running:
+            stop_resp = _control_request({"action": "stop", "target": "instance", "instance_id": instance_id}, timeout=10)
+            if not stop_resp or not stop_resp.get("success"):
+                err = (stop_resp or {}).get("error", "daemon 未响应") if stop_resp else "daemon 未运行"
+                return jsonify({"error": f"旧进程停止失败（{err}），已保留新配置但未重启"}), 500
+        start_resp = _control_request({"action": "start", "target": "instance", "instance_id": instance_id})
+        if start_resp and start_resp.get("success"):
+            return jsonify(start_resp.get("instance", updated))
+        err = (start_resp or {}).get("error", "daemon 未响应") if start_resp else "daemon 未运行"
+        detail = "旧进程已停止" if was_running else "实例仍为停止态"
+        return jsonify({"error": f"新配置已保存，但启动失败（{err}），{detail}"}), 500
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 

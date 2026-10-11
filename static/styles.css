@@ -1045,6 +1045,38 @@ button.loading::after {
   flex: 1;
 }
 
+.form-modal-foot {
+  display: flex;
+  gap: 12px;
+  justify-content: flex-end;
+  padding: 14px 18px 18px;
+  border-top: 1px solid rgba(212, 242, 255, 0.12);
+  flex-shrink: 0;
+}
+
+.form-modal-foot button {
+  min-width: 140px;
+}
+
+.form-modal-foot .secondary {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.form-modal-foot .secondary:hover {
+  background: rgba(255, 255, 255, 0.16);
+}
+
+.section-title.sticky-title {
+  position: sticky;
+  top: -16px;
+  z-index: 5;
+  background:
+    linear-gradient(180deg, rgba(17, 31, 50, 0.97), rgba(10, 20, 34, 0.94));
+  margin: 0 -16px 10px;
+  padding: 12px 16px 10px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+}
+
 .command-preview,
 .preview {
   margin-top: 8px;
