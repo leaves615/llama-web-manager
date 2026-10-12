@@ -536,6 +536,9 @@ class DaemonManager:
             except Exception:
                 pass
 
+        self._control_thread = threading.Thread(target=server_thread, daemon=True)
+        self._control_thread.start()
+
     def _serve_control_conn(self, conn) -> None:
         try:
             data = _recv_request(conn)
@@ -583,9 +586,6 @@ class DaemonManager:
                 conn.close()
             except Exception:
                 pass
-
-        self._control_thread = threading.Thread(target=server_thread, daemon=True)
-        self._control_thread.start()
 
     def _handle_command(self, request: Dict) -> Dict:
         """处理控制命令:启停互斥，list/get 不阻塞"""
