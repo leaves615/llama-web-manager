@@ -49,7 +49,36 @@ def _cleanup_pid_file():
 atexit.register(_cleanup_pid_file)
 
 
+DAEMON_SINGLETON_PORT = 18787
+_daemon_singleton_sock = None
+
+
+def _acquire_singleton() -> bool:
+    """抢固定哨兵端口：抢到的是正主，抢不到说明已有 daemon 在跑。
+    不依赖 pid 文件，文件丢失/沙盒隔离时依然有效。"""
+    global _daemon_singleton_sock
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("127.0.0.1", DAEMON_SINGLETON_PORT))
+        sock.listen(1)
+        _daemon_singleton_sock = sock
+        return True
+    except OSError:
+        return False
+
+
 def _another_daemon_running() -> bool:
+    # 先看哨兵端口是否被占（最可靠，不依赖文件）
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        probe.settimeout(1)
+        occupied = probe.connect_ex(("127.0.0.1", DAEMON_SINGLETON_PORT)) == 0
+        probe.close()
+        if occupied:
+            return True
+    except Exception:
+        pass
     pid, port = read_daemon_info()
     if not pid or pid == os.getpid():
         return False
@@ -1113,7 +1142,7 @@ class DaemonManager:
 
 
 def main():
-    if _another_daemon_running():
+    if not _acquire_singleton() or _another_daemon_running():
         daemon_logger.warning("another daemon already running, exit")
         return
     manager = DaemonManager()

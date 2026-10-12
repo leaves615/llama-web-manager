@@ -1388,20 +1388,34 @@ def _ensure_daemon_running():
         return
 
 
-def _acquire_file_lock(lock_fd):
+def _acquire_file_lock(lock_fd, blocking=False, timeout=0):
     """Cross-platform file locking"""
     if sys.platform == "win32":
-        try:
-            msvcrt.locking(lock_fd.fileno(), msvcrt.LK_NBLCK, 1)
-            return True
-        except OSError:
-            return False
+        deadline = time.monotonic() + timeout if blocking and timeout else 0
+        while True:
+            try:
+                msvcrt.locking(lock_fd.fileno(), msvcrt.LK_NBLCK, 1)
+                return True
+            except OSError:
+                if not blocking or (timeout and time.monotonic() >= deadline):
+                    return False
+                time.sleep(0.2)
     else:
-        try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return True
-        except BlockingIOError:
-            return False
+        if not blocking:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return True
+            except BlockingIOError:
+                return False
+        deadline = time.monotonic() + timeout if timeout else None
+        while True:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return True
+            except BlockingIOError:
+                if deadline is not None and time.monotonic() >= deadline:
+                    return False
+                time.sleep(0.2)
 
 
 def _release_file_lock(lock_fd):
@@ -1432,11 +1446,9 @@ def _ensure_daemon_ready():
     lock_path = APP_ROOT / "daemon.lock"
     lock_fd = None
     try:
-        # 以阻塞式文件锁保护：只有获得锁的进程会尝试启动 daemon
+        # 阻塞等锁：别人正在启动时跟着等，而不是直接返回误报未运行
         lock_fd = open(lock_path, "w")
-        if not _acquire_file_lock(lock_fd):
-            # 其他进程正在初始化 daemon，直接返回
-            lock_fd.close()
+        if not _acquire_file_lock(lock_fd, blocking=True, timeout=40):
             return
 
         # 双重检查，防止竞争
@@ -1536,18 +1548,56 @@ def daemon_status_stream():
 
 @app.post("/api/daemon/start")
 def daemon_start():
-    if _is_daemon_running():
-        return jsonify({"error": "守护进程已在运行"}), 400
-
-    _start_daemon_process()
-    if not _wait_for_daemon_ready(timeout=10):
-        return jsonify({"error": "守护进程启动失败"}), 500
-    return jsonify({"success": True})
+    # 文件锁串行化：防止启动中的 daemon 被误判为未运行而重复拉起
+    lock_fd = open(APP_ROOT / "daemon.lock", "w")
+    try:
+        if not _acquire_file_lock(lock_fd, blocking=True, timeout=35):
+            return jsonify({"error": "有其他启动正在进行，请稍后刷新页面"}), 409
+        if _is_daemon_running():
+            return jsonify({"error": "守护进程已在运行"}), 400
+        _start_daemon_process()
+        if not _wait_for_daemon_ready(timeout=30):
+            return jsonify({"error": "守护进程启动失败"}), 500
+        return jsonify({"success": True})
+    finally:
+        try:
+            _release_file_lock(lock_fd)
+            lock_fd.close()
+        except Exception:
+            pass
 
 
 @app.post("/api/daemon/stop")
 def daemon_stop():
-    if stop_daemon_via_tcp():
+    stopped = stop_daemon_via_tcp()
+    # 兜底：TCP 没停掉的残留 daemon.py 进程（含 pid 文件被覆盖的孤儿）直接终止
+    leftovers = []
+    try:
+        for proc in psutil.process_iter(["pid", "cmdline"]):
+            try:
+                cmd = " ".join(proc.info.get("cmdline") or [])
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+            if "daemon.py" in cmd and "process_iter" not in cmd:
+                leftovers.append(proc.info["pid"])
+    except Exception:
+        pass
+    for pid in leftovers:
+        try:
+            proc = psutil.Process(pid)
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except psutil.TimeoutExpired:
+                proc.kill()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    if stopped or not leftovers or _wait_for_daemon_stopped(timeout=5):
+        try:
+            if DAEMON_PID_FILE.exists():
+                DAEMON_PID_FILE.unlink()
+        except Exception:
+            pass
         return jsonify({"success": True})
     if not _is_daemon_running():
         return jsonify({"error": "守护进程未运行"}), 400
