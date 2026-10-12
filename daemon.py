@@ -178,17 +178,22 @@ def kill_process_tree(pid: int, include_parent: bool = True) -> bool:
 
 
 def _pid_alive(pid: int) -> bool:
-    """进程是否仍存活（僵尸态视为已退出，避免误判残留）"""
+    """进程是否仍存活：只认存在性，D 态（disk-sleep，模型加载时的正常状态）按存活处理；
+    只有僵尸态、真退出或 PID 不存在才算死亡"""
     try:
         proc = psutil.Process(pid)
-        if not proc.is_running():
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return False
+    # Popen 子进程：以是否被回收为准，最可靠
+    try:
+        if proc.status() in (psutil.STATUS_ZOMBIE, psutil.STATUS_DEAD):
             return False
-        try:
-            if proc.status() in (psutil.STATUS_ZOMBIE, psutil.STATUS_DEAD):
-                return False
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            return False
-        return True
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return False
+    except Exception:
+        pass
+    try:
+        return proc.is_running()
     except (psutil.NoSuchProcess, psutil.AccessDenied):
         return False
 
@@ -579,8 +584,12 @@ class DaemonManager:
             except Exception:
                 mem_status = "stopped"
             if mem_status == "running":
-                return "running", instance.pid
+                return self._with_serving_state(row, instance.pid)
             if mem_status.startswith("exited"):
+                guess = instance.pid or pid
+                if guess and _pid_alive(guess):
+                    daemon_logger.warning("mem exited but pid alive")
+                    return self._with_serving_state(row, guess)
                 self._db_execute(
                     "UPDATE instances SET status = 'exited', pid = NULL, updated_at = ? WHERE instance_id = ?",
                     (now_iso(), row["instance_id"]),
@@ -614,6 +623,37 @@ class DaemonManager:
             )
             return "exited", None
 
+    def _with_serving_state(self, row: Dict, pid: int) -> tuple[str, Optional[int]]:
+        port = self._serving_port(row)
+        if port and not self._port_serving(port):
+            return "starting", pid
+        return "running", pid
+
+    def _revive_by_port(self, row: Dict):
+        """DB 无 PID 但端口实际在监听：旧代码误判的实例，原地复活"""
+        port = self._serving_port(row)
+        if not port or not self._port_serving(port):
+            return None
+        pid = self._pid_listening_on(port)
+        if not pid:
+            return None
+        self._db_execute(
+            "UPDATE instances SET status = 'running', pid = ?, updated_at = ? WHERE instance_id = ?",
+            (pid, now_iso(), row["instance_id"]),
+        )
+        daemon_logger.info(f"revive {row['instance_id']} by port {port} -> pid {pid}")
+        return ("running", pid)
+
+    @staticmethod
+    def _pid_listening_on(port: int):
+        for conn in psutil.net_connections(kind="inet"):
+            try:
+                if (conn.status == psutil.CONN_LISTEN and conn.laddr and conn.laddr.port == port and conn.pid):
+                    return conn.pid
+            except Exception:
+                continue
+        return None
+
     @staticmethod
     def _port_serving(port: int, timeout: float = 0.5) -> bool:
         """端口是否已有服务在监听（区分 starting/running，避免按钮提前显示停止）"""
@@ -642,6 +682,10 @@ class DaemonManager:
         }
 
         status, pid = self._probe_persisted_instance(row, instance)
+        if status == "exited" and not pid:
+            revived = self._revive_by_port(dict(row))
+            if revived:
+                status, pid = revived
         result["status"] = status
         result["pid"] = pid
 
@@ -872,7 +916,9 @@ class DaemonManager:
                         mem_status = inst.status
                     except Exception:
                         mem_status = "stopped"
-                    if mem_status.startswith("exited"):
+                    if mem_status == "running":
+                        continue
+                    if mem_status.startswith("exited") and not _pid_alive(inst.pid or pid):
                         self._db_execute(
                             "UPDATE instances SET status = 'exited', pid = NULL, updated_at = ? WHERE instance_id = ?",
                             (now_iso(), instance_id),
