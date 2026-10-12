@@ -1142,7 +1142,10 @@ class DaemonManager:
 
 
 def main():
-    if not _acquire_singleton() or _another_daemon_running():
+    if _another_daemon_running():
+        daemon_logger.warning("another daemon already running, exit")
+        return
+    if not _acquire_singleton():
         daemon_logger.warning("another daemon already running, exit")
         return
     manager = DaemonManager()
