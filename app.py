@@ -74,23 +74,13 @@ def _is_daemon_running() -> bool:
             pass
         return False
     
-    # 验证TCP端口连通性
+    # 验证TCP端口连通性：连不上只返回 False，不删 pid 文件
+    # （daemon 忙时 accept 可能延迟，删文件会导致重复拉起顶掉正常进程）
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.settimeout(1)
-            result = sock.connect_ex(("127.0.0.1", port))
-            if result == 0:
-                return True
-        try:
-            DAEMON_PID_FILE.unlink()
-        except Exception:
-            pass
-        return False
+            sock.settimeout(3)
+            return sock.connect_ex(("127.0.0.1", port)) == 0
     except Exception:
-        try:
-            DAEMON_PID_FILE.unlink()
-        except Exception:
-            pass
         return False
 
 

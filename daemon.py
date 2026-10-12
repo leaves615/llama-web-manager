@@ -31,14 +31,36 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _cleanup_pid_file():
+    # 只删自己写的 pid 文件，避免双 daemon 时误删别人的
     try:
-        if DAEMON_PID_FILE.exists():
+        if not DAEMON_PID_FILE.exists():
+            return
+        try:
+            first = DAEMON_PID_FILE.read_text(encoding="utf-8").splitlines()
+            owner = int(first[0].strip()) if first else -1
+        except (ValueError, OSError):
+            return
+        if owner == os.getpid():
             DAEMON_PID_FILE.unlink()
     except Exception:
         pass
 
 
 atexit.register(_cleanup_pid_file)
+
+
+def _another_daemon_running() -> bool:
+    pid, port = read_daemon_info()
+    if not pid or pid == os.getpid():
+        return False
+    try:
+        proc = psutil.Process(pid)
+        if not proc.is_running():
+            return False
+        cmd = " ".join(proc.cmdline() or [])
+        return "daemon.py" in cmd
+    except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+        return False
 
 
 def find_free_port():
@@ -461,9 +483,24 @@ class DaemonManager:
                     threading.Thread(target=self._serve_control_conn, args=(conn,), daemon=True).start()
                 except socket.timeout:
                     continue
-                except Exception as e:
-                    daemon_logger.error(f"Control server accept error: {e}")
-                    break
+                except OSError as e:
+                    # 监听 socket 被抢占或短暂异常：重建监听，不退出
+                    daemon_logger.error(f"Control server accept error: {e}, rebuilding listener")
+                    try:
+                        self._control_server.close()
+                    except Exception:
+                        pass
+                    time.sleep(1)
+                    try:
+                        self._control_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        self._control_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                        self._control_server.bind(("127.0.0.1", self._control_port))
+                        self._control_server.listen(8)
+                        self._control_server.settimeout(1.0)
+                    except Exception as e2:
+                        daemon_logger.error(f"Control listener rebuild failed: {e2}")
+                        time.sleep(2)
+                    continue
 
             try:
                 self._control_server.close()
@@ -1076,6 +1113,9 @@ class DaemonManager:
 
 
 def main():
+    if _another_daemon_running():
+        daemon_logger.warning("another daemon already running, exit")
+        return
     manager = DaemonManager()
 
     if os.name != "nt":
