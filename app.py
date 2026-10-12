@@ -108,7 +108,7 @@ def _read_json_response(sock):
             return json.loads(line.decode("utf-8"))
 
 
-def _control_request(request: Dict, timeout: float = 10) -> Optional[Dict]:
+def _control_request(request: Dict, timeout: float = 10, retries: int = 2) -> Optional[Dict]:
     """向 daemon 发送 TCP 控制请求"""
     info = _get_daemon_info()
     if not info:
@@ -124,7 +124,7 @@ def _control_request(request: Dict, timeout: float = 10) -> Optional[Dict]:
         return None
 
     # 简单重试机制以提高鲁棒性
-    attempts = 3
+    attempts = max(1, retries + 1)
     for attempt in range(attempts):
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -1519,7 +1519,7 @@ def daemon_status_stream():
 
                 if running:
                     db_items = manager._list_persisted_instances()
-                    response = _control_request({"action": "list", "target": "instance"})
+                    response = _control_request({"action": "list", "target": "instance"}, timeout=3, retries=0)
                     if response and response.get("success"):
                         tcp_map = {inst["instance_id"]: inst for inst in response.get("instances", [])}
                         for item in db_items:
@@ -1569,8 +1569,8 @@ def list_instances():
     # 从 DB 查询实例列表
     db_instances = manager._list_persisted_instances()
     
-    # 通过 TCP 获取实时状态
-    response = _control_request({"action": "list", "target": "instance"})
+    # 通过 TCP 获取实时状态（短超时零重试，避免启停期间卡住列表刷新）
+    response = _control_request({"action": "list", "target": "instance"}, timeout=3, retries=0)
     if response and response.get("success"):
         # 将 TCP 返回的实时状态合并到 DB 数据中
         tcp_instances = {inst["instance_id"]: inst for inst in response.get("instances", [])}
